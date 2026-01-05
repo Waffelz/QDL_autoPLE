@@ -1,5 +1,7 @@
 import time
 from ctypes import c_float, c_int, c_char_p, c_int32, c_long, pointer, c_int, c_float
+from ctypes import POINTER, byref
+
 import numpy as np
 
 import matisse_controller.config as cfg
