@@ -9,8 +9,8 @@ Run (from project root):
   python scripts/test_powermeter.py --addr "GPIB0::5::INSTR"
 
 Notes:
-- This uses your PowerMeter.convert_reading_string_to_float() which (in your snippet)
-  converts to microW (µW). We also print W for convenience.
+- This uses your PowerMeter.convert_reading_string_to_float(), which (in your snippet)
+  returns microW (µW). We also print W.
 """
 
 import time
@@ -19,6 +19,7 @@ import statistics
 import sys
 from pathlib import Path
 import inspect
+from typing import Optional
 
 # --- Make sure the folder containing "functions26" is on sys.path ---
 HERE = Path(__file__).resolve()
@@ -34,17 +35,15 @@ sys.path.insert(0, str(root))
 from functions26.instruments.powermeter import PowerMeter
 
 
-def make_powermeter(channel: str, addr: str | None):
+def make_powermeter(channel: str, addr: Optional[str]):
     """
     Be robust to different PowerMeter __init__ signatures in your repo.
-    - If __init__ supports an address/port arg, pass it.
-    - Otherwise, set PowerMeter.powermeter_name before instantiation.
     """
     sig = inspect.signature(PowerMeter.__init__)
     params = sig.parameters
 
-    # If user gave an address but the constructor doesn't accept it,
-    # set the class attribute before instantiation (your earlier snippet uses this).
+    # If user gave an address but constructor doesn't accept it,
+    # set the class attribute before instantiation.
     if addr is not None:
         if ("instrument_port" not in params) and ("powermeter_port" not in params) and (len(params) <= 2):
             PowerMeter.powermeter_name = addr
@@ -55,7 +54,7 @@ def make_powermeter(channel: str, addr: str | None):
     if "powermeter_port" in params:
         return PowerMeter(channel=channel, powermeter_port=addr)
     if len(params) > 2:
-        # positional second argument (port/address) style
+        # positional (channel, port) style
         return PowerMeter(channel, addr)
     return PowerMeter(channel)
 
@@ -102,23 +101,18 @@ def main():
     print(f"Channel={args.channel}  Addr={args.addr or getattr(pm, 'powermeter_name', 'UNKNOWN')}")
 
     all_means_uW = []
-    all_means_W = []
     t0 = time.monotonic()
 
     try:
         for i in range(args.n):
             t_read0 = time.monotonic()
-            vals_uW, vals_W = read_once(pm)
+            vals_uW, _vals_W = read_once(pm)
             t_read1 = time.monotonic()
 
-            mean_uW = sum(vals_uW) / len(vals_uW) if vals_uW else None
-            mean_W = mean_uW * 1e-6 if mean_uW is not None else None
-
+            mean_uW = (sum(vals_uW) / len(vals_uW)) if vals_uW else None
             if mean_uW is not None:
                 all_means_uW.append(mean_uW)
-                all_means_W.append(mean_W)
 
-            # Print a few lines + periodic updates
             if i < 5 or (i + 1) % 20 == 0:
                 dt_read_ms = (t_read1 - t_read0) * 1e3
                 print(
@@ -132,7 +126,6 @@ def main():
             time.sleep(args.dt)
 
     finally:
-        # Close VISA session
         try:
             pm.powermeter.terminate_instrument()
         except Exception:
