@@ -2,21 +2,23 @@
 """
 scripts/test_ple_setup.py
 
-For your current repo where:
-  - matisse_controller.shamrock_ple.ple.PLE signature is (matisse)
-  - PLE does NOT provide setup_ws7()
+Matches your current matisse_controller/shamrock_ple/ple.py API:
+  class PLE:
+      def __init__(self, matisse): ...
+      @staticmethod
+      def load_andor_libs(): ... creates global ccd, shamrock
 
 This script:
-  1) imports ple.py and prints its path
-  2) constructs Matisse (best-effort via signature introspection)
-  3) constructs PLE(matisse)
-  4) reads wavemeter wavelength repeatedly via Matisse (best-effort)
+  - Imports ple module and prints file path
+  - Builds a PLE instance (you can pass --no-matisse to pass None)
+  - Calls PLE.load_andor_libs()
+  - Performs lightweight CCD + Shamrock sanity checks
 
 Run from project root:
   python scripts\\test_ple_setup.py
 
-Options:
-  python scripts\\test_ple_setup.py --n 200 --dt 0.03 --wavemeter-type WS7
+Optional:
+  python scripts\\test_ple_setup.py --quick-acq --exp 0.05
 """
 
 import sys
@@ -26,185 +28,125 @@ import inspect
 from pathlib import Path
 
 
-# --- Ensure project root is importable (parent of scripts/) ---
-ROOT = Path(__file__).resolve().parents[1]
+# --- Ensure project root is importable ---
+ROOT = Path(__file__).resolve().parents[1]  # project root = parent of scripts/
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
-def _try_call(obj, method_names, *args, **kwargs):
+def try_import_matisse():
     """
-    Try calling the first existing callable attribute from method_names on obj.
-    Returns the result or raises AttributeError if none exist.
+    Optional: import + construct a Matisse object.
+    If you only want to test Andor libs, you can pass None to PLE.
     """
-    for name in method_names:
-        if hasattr(obj, name):
-            fn = getattr(obj, name)
-            if callable(fn):
-                return fn(*args, **kwargs)
-    raise AttributeError(f"None of these methods exist/callable: {method_names}")
+    from matisse_controller.matisse.matisse import Matisse
+    sig = inspect.signature(Matisse)
+    print("Matisse class path:", inspect.getfile(Matisse))
+    print("Matisse signature :", sig)
 
-
-def _construct_with_signature(cls, preferred_by_name):
-    """
-    Construct cls by matching constructor parameter names to preferred_by_name,
-    and filling any remaining required positional parameters with None.
-
-    This avoids hard-coding signatures.
-    """
-    sig = inspect.signature(cls)
-    params = list(sig.parameters.values())
-
-    # Build positional args in order for POSITIONAL_ONLY / POSITIONAL_OR_KEYWORD
-    args = []
-    kwargs = {}
-
-    # Skip "self" if present (signature() for classes usually omits it, but just in case)
-    # For classes, signature(Matisse) usually shows (arg1, arg2, ...) without self.
-    for p in params:
-        # If parameter can be provided by name and we have a preferred value, use it.
-        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD):
-            if p.name in preferred_by_name:
-                args.append(preferred_by_name[p.name])
-            else:
-                # If required, use None as placeholder; if optional, omit to use default
-                if p.default is inspect._empty:
-                    args.append(None)
-        elif p.kind == p.KEYWORD_ONLY:
-            if p.name in preferred_by_name:
-                kwargs[p.name] = preferred_by_name[p.name]
-        # Ignore VAR_POSITIONAL/VAR_KEYWORD; not needed here.
-
-    return cls(*args, **kwargs)
-
-
-def get_matisse_wavelength_nm(matisse):
-    """
-    Best-effort wavelength read from Matisse object.
-    Tries common APIs used in Matisse controller codebases.
-    """
-    # Most likely from your earlier code:
-    #   matisse.wavemeter_wavelength()
-    # or perhaps:
-    #   matisse.wavemeter.wavelength()
-    # or:
-    #   matisse.get_wavelength()
+    # Best guess constructor call based on your earlier stack:
+    # Matisse(wavemeter_type, port)
+    # If your Matisse requires different args, edit here.
     try:
-        return float(_try_call(matisse, ["wavemeter_wavelength", "get_wavelength", "wavelength"]))
-    except AttributeError:
-        pass
-
-    # Try nested wavemeter object patterns
-    if hasattr(matisse, "wavemeter"):
-        wvm = getattr(matisse, "wavemeter")
-        try:
-            return float(_try_call(wvm, ["wavelength", "get_wavelength", "GetWavelength"], 0.0))
-        except Exception:
-            pass
-
-    raise RuntimeError(
-        "Couldn't find a wavelength-read method on Matisse. "
-        "Inspect matisse object with dir(matisse) and update get_matisse_wavelength_nm()."
-    )
+        return Matisse("WS7", None)
+    except TypeError:
+        # Fallback: try no-arg
+        return Matisse()
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--wavemeter-type", default="WS7", help="Passed into Matisse constructor when possible")
-    ap.add_argument("--port", default=None, help="Port for wavemeter / matisse if your constructor needs it")
-    ap.add_argument("--n", type=int, default=50, help="Number of wavelength samples")
-    ap.add_argument("--dt", type=float, default=0.05, help="Delay between samples (s)")
-    ap.add_argument("--print-matisse-scan-speeds", action="store_true", help="Try querying scan speeds if available")
+    ap.add_argument("--no-matisse", action="store_true",
+                    help="Construct PLE(None) instead of trying to construct a Matisse object.")
+    ap.add_argument("--quick-acq", action="store_true",
+                    help="Do a quick single acquisition (no cooldown). Requires Andor connected + Solis closed.")
+    ap.add_argument("--exp", type=float, default=0.05, help="Exposure time for quick acquisition (s)")
     args = ap.parse_args()
 
-    # Import ple + Matisse
     import matisse_controller.shamrock_ple.ple as ple_mod
-    from matisse_controller.matisse.matisse import Matisse
 
     print("PLE module path:", ple_mod.__file__)
-    print("PLE signature   :", inspect.signature(ple_mod.PLE))
-    print("Matisse path    :", inspect.getfile(Matisse))
-    print("Matisse signature:", inspect.signature(Matisse))
+    print("PLE signature  :", inspect.signature(ple_mod.PLE))
 
-    # Construct Matisse as robustly as possible
-    # Common signatures in your older code were: Matisse(wavemeter_type, matisse_wavemeter_port)
-    preferred = {
-        # guess common names:
-        "wavemeter_type": args.wavemeter_type,
-        "wavemeter": args.wavemeter_type,
-        "wavemeter_name": args.wavemeter_type,
-        "matisse_wavemeter_port": args.port,
-        "wavemeter_port": args.port,
-        "port": args.port,
-        "instrument_port": args.port,
-    }
-
-    try:
-        matisse = _construct_with_signature(Matisse, preferred)
-    except Exception as e:
-        print("FAILED to construct Matisse with introspection.")
-        print("Error:", repr(e))
-        print("\nTry editing this script to call Matisse(...) exactly as your code expects.")
-        raise
-
-    print("\nConstructed Matisse object:", type(matisse))
+    # Construct matisse if requested; otherwise None is fine for Andor-only tests
+    matisse = None
+    if not args.no_matisse:
+        try:
+            matisse = try_import_matisse()
+            print("Constructed matisse:", type(matisse))
+        except Exception as e:
+            print("WARNING: Could not construct Matisse; continuing with matisse=None.")
+            print("Reason:", repr(e))
+            matisse = None
 
     # Construct PLE(matisse)
+    ple = ple_mod.PLE(matisse)
+    print("Constructed PLE:", type(ple))
+
+    # Load Andor libs (creates global ccd/shamrock inside ple_mod)
+    print("\nCalling PLE.load_andor_libs() ...")
+    ple_mod.PLE.load_andor_libs()
+
+    ccd = getattr(ple_mod, "ccd", None)
+    shamrock = getattr(ple_mod, "shamrock", None)
+
+    if ccd is None:
+        raise RuntimeError("CCD is None after load_andor_libs(). Check Andor SDK/DLL access.")
+    if shamrock is None:
+        raise RuntimeError("Shamrock is None after load_andor_libs(). Check Shamrock SDK/DLL access.")
+
+    print("\n--- Andor Globals ---")
+    print("ccd     :", type(ccd))
+    print("shamrock:", type(shamrock))
+
+    # Lightweight CCD checks (should be fast)
     try:
-        ple = ple_mod.PLE(matisse)
+        w, h = ccd.get_camera_size()
+        print(f"CCD detector size: {w} x {h}")
     except Exception as e:
-        print("FAILED to construct PLE(matisse). Error:", repr(e))
-        raise
+        print("CCD get_camera_size failed:", repr(e))
 
-    print("Constructed PLE object:", type(ple))
-    print("PLE methods (subset):", [m for m in dir(ple) if not m.startswith("_")][:25], "...\n")
+    try:
+        temp = ccd.get_temperature()
+        print(f"CCD temperature: {temp:.2f} C")
+    except Exception as e:
+        print("CCD get_temperature failed:", repr(e))
 
-    # Optional: query Matisse scan speeds (if query() exists)
-    if args.print_matisse_scan_speeds and hasattr(matisse, "query"):
+    # Lightweight Shamrock checks (depends on what methods exist)
+    # We'll just print available public methods to guide next steps.
+    shamrock_methods = [m for m in dir(shamrock) if not m.startswith("_")]
+    print(f"Shamrock public methods (sample): {shamrock_methods[:25]} ...")
+
+    # Optional quick acquisition (no cooldown; avoids long waits)
+    if args.quick_acq:
+        print("\n--- Quick Acquisition ---")
+        print("NOTE: Ensure Andor Solis is CLOSED, otherwise the SDK often fails.")
         try:
-            rise = matisse.query("SCAN:RISINGSPEED?", True)
-            fall = matisse.query("SCAN:FALLINGSPEED?", True)
-            print("Matisse scan speeds:", rise, fall)
+            # Your CCD.setup() signature supports cool_down flag; keep it False for fast test.
+            # acquisition_mode/readout_mode default to SINGLE/FVB in your CCD code.
+            ccd.setup(exposure_time=args.exp, cool_down=False)
+            data = ccd.take_acquisition()
+            print("Acquisition OK.")
+            print("Data shape:", getattr(data, "shape", None))
+            # Print a couple values
+            try:
+                import numpy as np
+                arr = np.asarray(data)
+                print("Min/Max:", int(arr.min()), int(arr.max()))
+                print("Mean:", float(arr.mean()))
+            except Exception:
+                pass
         except Exception as e:
-            print("Matisse speed query failed:", repr(e))
-        print()
+            print("Quick acquisition FAILED:", repr(e))
 
-    # Wavelength sampling via matisse
-    print("Sampling wavelength via Matisse...")
-    wls = []
-    t0 = time.time()
-    for i in range(args.n):
-        wl = get_matisse_wavelength_nm(matisse)
-        wls.append(wl)
-        dt = time.time() - t0
-        print(f"[{i+1:4d}/{args.n}] t={dt:7.3f}s  wl={wl:.12f} nm")
-        time.sleep(args.dt)
+    # Cleanup (your clean_up_globals only nulls globals; CCD.__del__ shuts down on GC)
+    try:
+        ple_mod.PLE.clean_up_globals()
+        print("\nCleaned up ple globals.")
+    except Exception as e:
+        print("\nCleanup failed:", repr(e))
 
-    # Simple stats without numpy
-    wls_valid = [x for x in wls if x > 0]
-    if not wls_valid:
-        raise RuntimeError("No valid wavelength samples (>0).")
-
-    mean = sum(wls_valid) / len(wls_valid)
-    var = sum((x - mean) ** 2 for x in wls_valid) / max(1, (len(wls_valid) - 1))
-    std = var ** 0.5
-
-    print("\n--- Matisse/Wavemeter Results ---")
-    print(f"Valid samples: {len(wls_valid)}/{len(wls)}")
-    print(f"Mean (nm):     {mean:.12f}")
-    print(f"Std (nm):      {std:.12f}")
-    print(f"Min (nm):      {min(wls_valid):.12f}")
-    print(f"Max (nm):      {max(wls_valid):.12f}")
-    print("--------------------------------\n")
-
-    # Cleanup if your PLE module has global cleanup (some versions do)
-    if hasattr(ple_mod, "PLE") and hasattr(ple_mod.PLE, "clean_up_globals"):
-        try:
-            ple_mod.PLE.clean_up_globals()
-        except Exception:
-            pass
-
-    print("DONE")
+    print("\nDONE")
 
 
 if __name__ == "__main__":
