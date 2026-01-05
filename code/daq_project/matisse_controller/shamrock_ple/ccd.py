@@ -1,6 +1,5 @@
 import time
-from ctypes import c_float, c_int, c_char_p, c_int32, c_long, pointer
-
+from ctypes import c_float, c_int, c_char_p, c_int32, c_long, pointer, c_int, c_float
 import numpy as np
 
 import matisse_controller.config as cfg
@@ -18,9 +17,32 @@ class CCD:
     PIXEL_WIDTH = 26.  # in um
     PIXEL_HEIGHT = 26.  # in um
 
+    def _bind_prototypes(self):
+        """
+        Bind argtypes/restype for the SDK calls we use.
+        This prevents ctypes from guessing wrong.
+        """
+        lib = self.lib
+
+        # Temperature calls (SDK2)
+        if hasattr(lib, "GetTemperatureF"):
+            lib.GetTemperatureF.argtypes = [POINTER(c_float)]
+            lib.GetTemperatureF.restype = c_int
+        lib.GetTemperature.argtypes = [POINTER(c_int)]
+        lib.GetTemperature.restype = c_int
+
+        lib.SetTemperature.argtypes = [c_int]
+        lib.SetTemperature.restype = c_int
+
+        lib.CoolerON.argtypes = []
+        lib.CoolerON.restype = c_int
+        lib.CoolerOFF.argtypes = []
+        lib.CoolerOFF.restype = c_int
+
     def __init__(self, initialize_on_definition=True):
 
         self.lib = load_lib(CCD.LIBRARY_NAME)
+        self._bind_prototypes()  # <<< add this line
 
         if initialize_on_definition:
             self.initialize()
@@ -156,16 +178,38 @@ class CCD:
         self.lib.SetExposureTime(c_float(exposure_time))
         self.lib.SetFilterMode(c_int(cosmic_ray_filter))
 
+    # def get_temperature(self) -> float:
+    #     """
+    #     Returns
+    #     -------
+    #     float
+    #         the current temperature of the CCD camera
+    #     """
+    #     temperature = c_float()
+    #     self.lib.GetTemperature(pointer(temperature))
+    #     return temperature.value
+#updated methods:
     def get_temperature(self) -> float:
         """
-        Returns
-        -------
-        float
-            the current temperature of the CCD camera
+        Temperature in °C as a float (even if SDK gives an int).
         """
-        temperature = c_float()
-        self.lib.GetTemperature(pointer(temperature))
-        return temperature.value
+        _code, tempC = self.get_temperature_status()
+        return tempC
+
+    def get_temperature_status(self) -> (int, float):
+        """
+        Returns (status_code, temperature_C).
+        SDK2 GetTemperature returns a status code and fills an int temperature.
+        Some builds also provide GetTemperatureF.
+        """
+        if hasattr(self.lib, "GetTemperatureF"):
+            t = c_float()
+            code = int(self.lib.GetTemperatureF(byref(t)))
+            return code, float(t.value)
+
+        t = c_int()
+        code = int(self.lib.GetTemperature(byref(t)))
+        return code, float(t.value)
 
     def set_temperature(self, temperature: float):
         """
@@ -187,23 +231,54 @@ class CCD:
         self.lib.GetTemperatureRange(pointer(min_temp), pointer(max_temp))
         return min_temp.value, max_temp.value
 
-    def wait_to_cooldown(self):
-        """Goes on a loop to wait until the temperature is close to the set temperature of the CCD camera."""
-        # Cooler stops when temp is within 3 degrees of target, so wait until it's close
-        # CCD normally takes a few minutes to fully cool down
-        temperature = self.get_temperature_range()
+    # def wait_to_cooldown(self):
+    #     """Goes on a loop to wait until the temperature is close to the set temperature of the CCD camera."""
+    #     # Cooler stops when temp is within 3 degrees of target, so wait until it's close
+    #     # CCD normally takes a few minutes to fully cool down
+    #     temperature = self.get_temperature_range()
+    #     while not self.temperature_ok:
+    #         if self.exit_flag:
+    #             return
+    #         current_temp = self.get_temperature()
+    #         print(f"Cooling CCD. Current temperature is {round(current_temp, 2)} °C")
+    #         # if current_temp < cfg.get(cfg.PLE_TARGET_TEMPERATURE) + cfg.get(cfg.PLE_TEMPERATURE_TOLERANCE):
+    #         if current_temp <= -62:
+    #             print("reached -62C")
+    #         # if current_temp <= -55:
+    #         #     print("reached -55C")
+    #             self.temperature_ok = True
+    #         time.sleep(10)
+
+    def wait_to_cooldown(self, target_C: float = -65.0, tol_C: float = 1.0, poll_s: float = 5.0,
+                         timeout_s: float = 1200):
+        """
+        Wait until CCD temperature <= target_C + tol_C (or SDK reports stabilized), or timeout.
+        """
+        t_start = time.time()
+        self.temperature_ok = False
+
         while not self.temperature_ok:
             if self.exit_flag:
                 return
-            current_temp = self.get_temperature()
-            print(f"Cooling CCD. Current temperature is {round(current_temp, 2)} °C")
-            # if current_temp < cfg.get(cfg.PLE_TARGET_TEMPERATURE) + cfg.get(cfg.PLE_TEMPERATURE_TOLERANCE):
-            if current_temp <= -61:
-                print("reached -61C")
-            # if current_temp <= -55:
-            #     print("reached -55C")
+
+            code, tempC = self.get_temperature_status()
+            print(f"Cooling CCD: T={tempC:.1f} °C  (status={code})")
+
+            # If SDK reports stabilized, we can accept it.
+            if hasattr(CCDErrorCode,
+                       "DRV_TEMPERATURE_STABILIZED") and code == CCDErrorCode.DRV_TEMPERATURE_STABILIZED.value:
                 self.temperature_ok = True
-            time.sleep(10)
+                break
+
+            if tempC <= (target_C + tol_C):
+                self.temperature_ok = True
+                break
+
+            if (time.time() - t_start) > timeout_s:
+                raise TimeoutError(
+                    f"CCD did not reach {target_C}±{tol_C} °C within {timeout_s}s (last T={tempC:.1f}°C)")
+
+            time.sleep(poll_s)
 
     def take_acquisition(self, num_points=WIDTH) -> np.ndarray:
         """
