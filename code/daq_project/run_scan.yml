@@ -1,0 +1,81 @@
+# configs/run_scan.yml
+RunScan:
+  output:
+    directory: "data"
+    basename: "scan_737_to_739"
+    format: "h5"          # "h5" or "npz"
+    overwrite: true
+    save_meta_json: true
+
+  scan:
+    start_nm: 737.0
+    end_nm: 739.0
+
+    # Sampling for calibration traces (these run during the scan / kinetic series)
+    ws7_sample_period_s: 0.02
+    power_sample_period_s: 0.05
+
+    # If true (recommended for Andor kinetics), scan_speed_nm_per_s is computed from:
+    #   duration = n_frames * cycle_s_actual
+    # so the wavemeter/power traces end when the kinetic series ends.
+    auto_scan_speed_from_kinetic: true
+
+    # Used only if auto_scan_speed_from_kinetic=false
+    scan_speed_nm_per_s: 0.005
+
+    max_run_time_s: 600
+
+    # Optional: stop slightly before/after end_nm.
+    # For upward scan, stop_wl = end_nm - stop_margin_nm
+    # For downward scan, stop_wl = end_nm + stop_margin_nm
+    stop_margin_nm: 0.0
+
+  instruments:
+    wavemeter:
+      type: "WS7"
+
+    matisse:
+      wavemeter_type: "WS7"
+
+    powermeter:
+      enabled: true
+      channel: "A"               # "A", "B", or "AB"
+
+    detector:
+      # Choose one:
+      #   "timetagger_counts"  -> count photons per exposure window (continuous scan)
+      #   "andor_kinetic"      -> kinetic series (.sif) + matched wavemeter/power traces
+      mode: "andor_kinetic"
+
+      timetagger_counts:
+        serial: null
+        click:
+          physical_channel: 1
+          trigger_v: -0.08
+          edge: "falling"        # negative-going pulse -> usually falling edge
+        exposure_s: 0.10         # integration window per point (seconds)
+
+      andor_kinetic:
+        # Uses matisse_controller.shamrock_ple.ccd.CCD
+        exposure_s: 0.10
+        cycle_s: 0.12
+        n_frames: 800
+
+        cool_down: true
+        temperature_C: -70
+
+        # These map into matisse_controller.shamrock_ple.constants READ_MODE_* and COSMIC_RAY_FILTER_*
+        # Supported readout_mode strings in run_scan.py:
+        #   FVB, SINGLE_TRACK, MULTI_TRACK, RANDOM_TRACK, IMAGE
+        readout_mode: "FVB"
+
+        # bool (preferred) or ON/OFF
+        cosmic_ray_filter: true
+
+        # Reserved for future optional passthroughs; currently run_scan.py only uses the above keys.
+        ccd_kwargs: {}
+
+  metadata:
+    sample: "ZnO Sn-Li donor"
+    operator: "Xingyi"
+    note: "Continuous scan with selectable detector (TimeTagger counts or Andor kinetics)."

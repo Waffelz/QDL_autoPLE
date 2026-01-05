@@ -1,0 +1,50 @@
+PLEScan:
+  DAQController:
+    import_path : qt3utils.applications.controllers.andor_spectrometer
+    class_name  : AndorSpectrometerController
+    configure :
+      # Devices
+      # - Device Index
+      ccd_device_index: 0
+      spg_device_index: 0
+      # Spectrograph
+      # - Turret
+      grating: null
+      center_wavelength: 370 # nm
+      # - Calibration
+      pixel_offset: 0.
+      wavelength_offset: 0.  # nm
+      # - Ports
+      input_port: SIDE  # or DIRECT
+      output_port: DIRECT  # or SIDE
+      # Acquisition
+      # - Modes
+      read_mode: FVB  # or SINGLE_TRACK
+      acquisition_mode: SINGLE_SCAN  # or SINGLE_SCAN or KINETICS
+      trigger_mode: INTERNAL  # or EXTERNAL
+      # - Timing
+      exposure_time: 10  # seconds
+      number_of_accumulations: 1
+      accumulation_cycle_time: 10  # seconds - will always end up higher than exposure time
+      number_of_kinetics: 1
+      kinetic_cycle_time: 1  # seconds - will always end up higher than accumulation cycle time
+      # - Data-Pre-Processing
+      baseline_clamp: true  # or false - will keep the electronic noise floor to the same level
+      cosmic_ray_removal: true  # or false - in accumulation mode, will remove peaks that look like cosmic rays
+      keep_clean_on_external_trigger: true  # or false - when an external trigger is used, keeps the CCD free of counts
+      # - Single Track Setup
+      single_track_center_row: null  # number in [1, 256]
+      single_track_height: null  # number that does not exceed the above limits if added or subtracted to the center
+      # Electronics
+      # - Vertical Shift
+      vertical_shift_speed: null  # μs - must be string - find other options in the drop-down menu on the GUI.
+      # - Horizontal Shift
+      horizontal_shift_speed: (0, 0, 0.05)   # MHz - must be string - find other options in the drop-down menu on the GUI- previously null.
+      pre_amp_gain: null  # must be string - find other options in the drop-down menu on the GUI.
+      # Temperature
+      # - Set Point
+      target_sensor_temperature: -65  # in deg C
+      reach_temperature_before_acquisition: true  # or false - Will wait until the target temperature is reached if true
+      # - Cooler
+      cooler: true  # or false - will turn CCD cooler on if true
+      cooler_persistence: true  # or false - will keep the CCD cold even after the program ends, as long as Andor Solis does not open
