@@ -1,28 +1,39 @@
 #!/usr/bin/env python3
 """
-WS7 smoke test (direct driver, no PLE dependency).
-Run on the instrument PC where wlmData.dll is available.
+WS7 smoke test (direct driver).
 
 Run:
   python scripts/test_ws7.py --n 200 --dt 0.02
-  python scripts/test_ws7.py --n 200 --dt 0.02 --ch2
 """
 
 import time
 import argparse
 import statistics
+import sys
+from pathlib import Path
 
-from functions26.instruments.ws7 import WS7  # <-- your driver
+# --- Make sure the folder containing "functions26" is on sys.path ---
+HERE = Path(__file__).resolve()
+root = None
+for p in [HERE.parent] + list(HERE.parents):
+    if (p / "functions26").exists():
+        root = p
+        break
+if root is None:
+    raise RuntimeError("Could not find a 'functions26' folder in any parent directory.")
+sys.path.insert(0, str(root))
+
+from functions26.instruments.ws7 import WS7  # now this should work
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--n", type=int, default=200, help="number of samples")
-    ap.add_argument("--dt", type=float, default=0.02, help="sleep between samples (s)")
-    ap.add_argument("--ch2", action="store_true", help="read GetWavelength2 instead of GetWavelength")
+    ap.add_argument("--n", type=int, default=200)
+    ap.add_argument("--dt", type=float, default=0.02)
+    ap.add_argument("--ch2", action="store_true")
     args = ap.parse_args()
 
-    ws7 = WS7()  # loads wlmData.dll and exposes ws7.lib
+    ws7 = WS7()
 
     samples = []
     t0 = time.monotonic()
@@ -37,18 +48,16 @@ def main():
         except Exception:
             wl = -1.0
 
-        wl_valid = wl > 0
-        if wl_valid:
+        if wl > 0:
             samples.append(wl)
 
         if i < 5 or (i + 1) % 50 == 0:
-            print(f"[{i+1:4d}/{args.n}] t={time.monotonic()-t0:7.3f}s  wl={wl if wl_valid else None}")
+            print(f"[{i+1:4d}/{args.n}] t={time.monotonic()-t0:7.3f}s  wl={wl if wl > 0 else None}")
 
         time.sleep(args.dt)
 
     if not samples:
         print("\nNo valid wavelength samples (>0).")
-        print("Common causes: WS7 app/service not running, no signal, wrong channel, DLL not found on PATH.")
         return
 
     mean = statistics.mean(samples)
