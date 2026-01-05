@@ -2,6 +2,14 @@
 import time
 import argparse
 
+
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]  # project root (one level above scripts/)
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from matisse_controller.shamrock_ple.ccd import CCD
 
 def main():
