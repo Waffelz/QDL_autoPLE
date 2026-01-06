@@ -1,159 +1,173 @@
 #!/usr/bin/env python3
 """
-Matisse scan + WS7 monitor smoke test (using your repo's Matisse driver).
+Test: Matisse scan while monitoring WS7 (optionally displaying air wavelength).
 
-Run from project root:
-  cd D:\Dropbox Folder\Dropbox\35share\Python\Xingyi\autoPLE\QDL_autoPLE-main\code\daq_project
+Default behavior (recommended):
+  - Measure current WS7 vacuum wavelength
+  - Scan by +delta (or -delta) from the current wavelength
+This guarantees the scan doesn't "finish instantly" because you're already past the target.
 
-Example:
-  python script\test_matisse_scan_ws7.py --start 739.500 --end 739.510 --speed 0.002 --ws7-dt 0.05 --max-s 180
+Run:
+  python script/test_matisse_scan_ws7.py --delta 0.01 --speed 0.002
+  python script/test_matisse_scan_ws7.py --delta -0.01 --speed 0.002
+  python script/test_matisse_scan_ws7.py --start 739.30 --end 739.31 --speed 0.002 --force-absolute
 """
 
+import time
 import argparse
 import sys
-import time
 from pathlib import Path
 
-# --- ensure repo root is on sys.path ---
+# --- Ensure project root is on sys.path so matisse_controller/functions26 import works ---
 HERE = Path(__file__).resolve()
-ROOT = HERE.parents[1]  # project root = parent of script/
+ROOT = HERE.parents[1]  # adjust if your folder layout differs: script/ is under project root
 sys.path.insert(0, str(ROOT))
 
 from functions26.instruments.ws7 import WS7
+from matisse_controller.matisse import Matisse
 
 
-def connect_matisse(wavemeter_type: str = "WS7", wavemeter_port=None):
-    """
-    Your matisse_controller.matisse.Matisse signature is (wavemeter_type='WaveMaster', wavemeter_port=None).
-    It likely reads the VISA resource from matisse_controller.config/configuration.
-    """
-    import inspect
-    from matisse_controller.matisse import Matisse
+def vacuum_to_air_nm(lambda_vac_nm: float) -> float:
+    # Ciddor 1996 constants via APOGEE note :contentReference[oaicite:3]{index=3}
+    lam_um = lambda_vac_nm * 1e-3
+    inv_lam2 = 1.0 / (lam_um * lam_um)
+    a = 0.0
+    b1 = 5.792105e-2
+    b2 = 1.67917e-3
+    c1 = 238.0185
+    c2 = 57.362
+    n = 1.0 + (a + b1 / (c1 - inv_lam2) + b2 / (c2 - inv_lam2))
+    return lambda_vac_nm / n
 
-    print("Matisse class:", Matisse)
-    print("Matisse signature:", inspect.signature(Matisse))
 
-    # IMPORTANT: do NOT pass VISA resource string; driver likely reads from config.
-    return Matisse(wavemeter_type=wavemeter_type, wavemeter_port=wavemeter_port)
+def read_ws7_vac_nm(ws7: WS7) -> float:
+    wl = float(ws7.lib.GetWavelength(0.0))
+    return wl
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--start", type=float, required=True, help="start wavelength (nm)")
-    ap.add_argument("--end", type=float, required=True, help="end wavelength (nm)")
     ap.add_argument("--speed", type=float, default=0.002, help="scan speed (nm/s)")
-    ap.add_argument("--ws7-dt", type=float, default=0.05, help="WS7 sampling period (s)")
-    ap.add_argument("--max-s", type=float, default=180.0, help="max runtime (s)")
-    ap.add_argument("--print-every", type=int, default=10, help="print every N samples")
-    ap.add_argument("--tol", type=float, default=0.002, help="tolerance (nm) to start scan")
-    ap.add_argument("--matisse-wavemeter-type", default="WS7", help="force matisse wavemeter_type (avoid WaveMaster)")
+    ap.add_argument("--dt", type=float, default=0.2, help="print period (s)")
+    ap.add_argument("--timeout", type=float, default=120.0, help="max run time (s)")
+    ap.add_argument("--medium", choices=["air", "vac"], default="air")
+
+    # Relative scan (default)
+    ap.add_argument("--delta", type=float, default=0.01,
+                    help="scan delta (nm) relative to current (vacuum nm). Use negative to scan down.")
+
+    # Absolute scan (optional)
+    ap.add_argument("--start", type=float, default=None)
+    ap.add_argument("--end", type=float, default=None)
+    ap.add_argument("--force-absolute", action="store_true",
+                    help="If set, use --start/--end as absolute targets; abort if current is already past end.")
+
     args = ap.parse_args()
 
-    start_nm = float(args.start)
-    end_nm = float(args.end)
-    speed = float(args.speed)
-
-    scan_dir = 0 if (end_nm - start_nm) > 0 else 1
-    stop_wl = end_nm
-
-    print("\nConnecting WS7...")
+    print("Connecting WS7...")
     ws7 = WS7()
-    print("WS7 OK.")
+    print("WS7 OK.\n")
 
-    print("\nConnecting Matisse...")
-    matisse = connect_matisse(wavemeter_type=str(args.matisse_wavemeter_type))
-    print("Matisse OK.")
+    print("Connecting Matisse...")
+    # Matisse constructor in your repo is (wavemeter_type='WaveMaster', wavemeter_port=None)
+    # so do NOT pass visa_resource here.
+    matisse = Matisse(wavemeter_type="WS7", wavemeter_port=None)
+    print("Matisse OK.\n")
 
-    # Some drivers expose query(); if yours does, show IDN
-    if hasattr(matisse, "query"):
-        try:
-            ans = matisse.query("*IDN?", True)
-            print("*IDN? ->", ans)
-        except Exception:
-            pass
+    # Read current wavelength (vacuum)
+    wl0_vac = read_ws7_vac_nm(ws7)
+    if wl0_vac <= 0:
+        raise RuntimeError("WS7 returned invalid wavelength (<=0).")
 
-    # Optional stabilize off
-    if hasattr(matisse, "stabilize_off"):
-        try:
-            matisse.stabilize_off()
-        except Exception:
-            pass
+    # Decide scan targets (in VACUUM nm for control)
+    if args.force_absolute:
+        if args.start is None or args.end is None:
+            raise ValueError("--force-absolute requires --start and --end.")
+        start_vac = float(args.start)
+        end_vac = float(args.end)
+    else:
+        start_vac = wl0_vac
+        end_vac = wl0_vac + float(args.delta)
 
-    # Set scan speed (your driver may forward SCPI to the laser)
-    if hasattr(matisse, "query"):
-        try:
-            matisse.query(f"SCAN:RISINGSPEED {speed:.20f}")
-            matisse.query(f"SCAN:FALLINGSPEED {speed:.20f}")
-        except Exception as e:
-            print("Warning: could not set SCAN:*SPEED via matisse.query():", e)
+    scan_dir = 0 if end_vac >= start_vac else 1  # 0 up, 1 down
 
-    # Set target wavelength if supported
-    if hasattr(matisse, "target_wavelength"):
-        try:
-            matisse.target_wavelength = round(start_nm, 6)
-        except Exception:
-            pass
+    def disp(wl_vac: float) -> float:
+        return vacuum_to_air_nm(wl_vac) if args.medium == "air" else wl_vac
 
-    print(f"\nWaiting until WS7 ~ start ({start_nm:.6f} nm) within ±{args.tol} nm ...")
-    t0_wait = time.monotonic()
-    while True:
-        wl = float(ws7.lib.GetWavelength(0.0))
-        if wl > 0 and abs(wl - start_nm) <= args.tol:
-            print(f"Locked-ish: WS7={wl:.6f} nm")
-            break
-        if (time.monotonic() - t0_wait) > 60.0:
-            print(f"Proceeding anyway (didn't reach tol within 60s). WS7={wl if wl>0 else None}")
-            break
-        time.sleep(0.2)
+    # If absolute mode, sanity check so we don't “finish instantly”
+    if args.force_absolute:
+        if scan_dir == 0 and wl0_vac >= end_vac:
+            raise RuntimeError(
+                f"Already past end: current={wl0_vac:.6f} nm (vac) >= end={end_vac:.6f} nm. "
+                "Either retune first or use relative mode (default)."
+            )
+        if scan_dir == 1 and wl0_vac <= end_vac:
+            raise RuntimeError(
+                f"Already past end: current={wl0_vac:.6f} nm (vac) <= end={end_vac:.6f} nm. "
+                "Either retune first or use relative mode (default)."
+            )
 
-    print(f"\nStarting scan dir={scan_dir} from {start_nm:.6f} -> {end_nm:.6f} at speed={speed} nm/s")
+    print(f"Current WS7: {disp(wl0_vac):.9f} nm ({args.medium})  [vac={wl0_vac:.9f}]")
+    print(f"Scanning dir={scan_dir} from start_vac={start_vac:.6f} -> end_vac={end_vac:.6f} at speed={args.speed} nm/s")
 
-    if not hasattr(matisse, "start_scan"):
-        raise RuntimeError("Your Matisse object has no start_scan(). Print dir(matisse) and we’ll adapt.")
+    # Configure scan speed (your wrapper already used these successfully in earlier code)
+    try:
+        matisse.query(f"SCAN:RISINGSPEED {args.speed:.20f}")
+        matisse.query(f"SCAN:FALLINGSPEED {args.speed:.20f}")
+    except Exception as e:
+        print(f"WARNING: Could not set scan speed via SCAN:*SPEED ({e}). Continuing...")
 
-    start_wall = time.time()
-    samples = 0
-    last_print = 0
+    # If your wrapper supports it, set target_wavelength for safety
+    try:
+        matisse.target_wavelength = round(float(end_vac), 6)
+    except Exception:
+        pass
+
+    t_start = time.monotonic()
+    last_print = 0.0
 
     try:
+        # Start the scan
         matisse.start_scan(scan_dir)
 
+        # Poll WS7 until we cross end
+        i = 0
         while True:
-            if (time.time() - start_wall) > args.max_s:
-                raise TimeoutError(f"Timed out after {args.max_s}s before reaching target.")
+            now = time.monotonic()
+            if (now - t_start) > args.timeout:
+                raise TimeoutError(f"Timed out after {args.timeout}s without reaching target.")
 
-            wl = float(ws7.lib.GetWavelength(0.0))
-            samples += 1
+            wl_vac = read_ws7_vac_nm(ws7)
+            if wl_vac > 0 and (now - last_print) >= args.dt:
+                i += 1
+                print(f"[{i:4d}] t={now - t_start:7.2f}s  WS7_{args.medium}={disp(wl_vac):.9f}  (vac={wl_vac:.9f})")
+                last_print = now
 
-            if samples <= 5 or (samples - last_print) >= args.print_every:
-                print(f"[{samples:5d}] t={time.time()-start_wall:7.2f}s  WS7={wl if wl>0 else None}")
-                last_print = samples
+            if scan_dir == 0 and wl_vac >= end_vac:
+                print(f"Reached target (vac): {wl_vac:.6f} >= {end_vac:.6f}")
+                break
+            if scan_dir == 1 and wl_vac <= end_vac:
+                print(f"Reached target (vac): {wl_vac:.6f} <= {end_vac:.6f}")
+                break
 
-            if wl > 0:
-                if scan_dir == 0 and wl >= stop_wl:
-                    print(f"Reached target: WS7={wl:.6f} nm >= {stop_wl:.6f} nm")
-                    break
-                if scan_dir == 1 and wl <= stop_wl:
-                    print(f"Reached target: WS7={wl:.6f} nm <= {stop_wl:.6f} nm")
-                    break
-
-            time.sleep(args.ws7_dt)
+            time.sleep(0.02)
 
     finally:
         print("\nStopping scan...")
-        if hasattr(matisse, "stop_scan"):
-            try:
-                matisse.stop_scan()
-            except Exception:
-                pass
+        try:
+            matisse.stop_scan()
+        except Exception:
+            pass
 
-        if hasattr(matisse, "stabilize_on"):
+        # Try to close gracefully if your class supports it (prevents thread errors on exit)
+        if hasattr(matisse, "close"):
             try:
-                matisse.stabilize_on()
+                matisse.close()
             except Exception:
                 pass
 
     print("\nDONE")
+    print(f"End WS7: {disp(read_ws7_vac_nm(ws7)):.9f} nm ({args.medium})")
 
 
 if __name__ == "__main__":
