@@ -212,141 +212,157 @@ def start_scan_to_target(
     wl_end = ws7_read_air_nm(ws7, ch2=ch2)
     print(f"Reached end: WS7_air={wl_end:.9f} nm (target {end_nm:.9f})")
 
+def safe_stop_scan(matisse):
+    try:
+        if matisse is not None:
+            # If your Matisse wrapper has stop_scan():
+            if hasattr(matisse, "stop_scan"):
+                matisse.stop_scan()
+            else:
+                matisse.query("SCAN:STATUS STOP")
+    except Exception as e:
+        print(f"(warn) failed to stop scan: {e}")
+
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--start", type=float, required=True, help="Start wavelength to align to (nm, AIR).")
-    ap.add_argument("--tol", type=float, default=0.002, help="Tolerance (nm) for start and segment ends.")
-    ap.add_argument("--dt", type=float, default=0.05, help="WS7 poll dt (s).")
-    ap.add_argument("--ch2", action="store_true", help="Use WS7 channel 2 if supported.")
-    ap.add_argument("--prelock", choices=["none", "stabilize", "full"], default="stabilize",
-                    help="none=do nothing; stabilize=seek then stabilize; full=call set_wavelength(start)")
-    ap.add_argument("--seek_speed", type=float, default=0.01, help="nm/s used to SEEK to start wavelength.")
-    ap.add_argument("--seek_timeout", type=float, default=60.0, help="seconds allowed to SEEK to start.")
-    ap.add_argument("--segments", type=str, required=True,
-                    help="Scan plan: 'end_nm,speed;end_nm,speed;...' (or delta,speed with --relative)")
-    ap.add_argument("--relative", action="store_true",
-                    help="Interpret segment endpoints as cumulative delta from start.")
-    args = ap.parse_args()
-
-    start_nm = float(args.start)
-    tol_nm = float(args.tol)
-
-    # WS7
-    print("Connecting WS7...")
-    ws7 = WS7()
-    bind_ws7_prototypes(ws7.lib)
-    wl0 = ws7_read_air_nm(ws7, ch2=args.ch2)
-    print(f"WS7 OK. Current WS7_air={wl0 if wl0>0 else None}")
-
-    # Matisse
-    print("\nConnecting Matisse...")
-    matisse = Matisse(wavemeter_type="WS7")
-    print("Matisse OK.")
     try:
-        print("Laser locked?:", matisse.laser_locked())
-    except Exception:
-        print("Laser locked?: (unknown)")
+        # run all segments
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--start", type=float, required=True, help="Start wavelength to align to (nm, AIR).")
+        ap.add_argument("--tol", type=float, default=0.002, help="Tolerance (nm) for start and segment ends.")
+        ap.add_argument("--dt", type=float, default=0.05, help="WS7 poll dt (s).")
+        ap.add_argument("--ch2", action="store_true", help="Use WS7 channel 2 if supported.")
+        ap.add_argument("--prelock", choices=["none", "stabilize", "full"], default="stabilize",
+                        help="none=do nothing; stabilize=seek then stabilize; full=call set_wavelength(start)")
+        ap.add_argument("--seek_speed", type=float, default=0.01, help="nm/s used to SEEK to start wavelength.")
+        ap.add_argument("--seek_timeout", type=float, default=60.0, help="seconds allowed to SEEK to start.")
+        ap.add_argument("--segments", type=str, required=True,
+                        help="Scan plan: 'end_nm,speed;end_nm,speed;...' (or delta,speed with --relative)")
+        ap.add_argument("--relative", action="store_true",
+                        help="Interpret segment endpoints as cumulative delta from start.")
+        args = ap.parse_args()
 
-    # Stop any running scan
-    try:
-        if matisse.is_scanning():
-            matisse.stop_scan()
-    except Exception:
-        pass
+        start_nm = float(args.start)
+        tol_nm = float(args.tol)
 
-    # -----------------------
-    # Pre-lock / align start
-    # -----------------------
-    print(f"\nPre-lock mode: {args.prelock}")
-    if args.prelock == "full":
-        print(f"Calling matisse.set_wavelength({start_nm:.6f}) ...")
-        matisse.set_wavelength(start_nm)
+        # WS7
+        print("Connecting WS7...")
+        ws7 = WS7()
+        bind_ws7_prototypes(ws7.lib)
+        wl0 = ws7_read_air_nm(ws7, ch2=args.ch2)
+        print(f"WS7 OK. Current WS7_air={wl0 if wl0 > 0 else None}")
 
-    elif args.prelock == "stabilize":
-        # Ensure lock correction if your class supports it (optional)
+        # Matisse
+        print("\nConnecting Matisse...")
+        matisse = Matisse(wavemeter_type="WS7")
+        print("Matisse OK.")
         try:
-            if hasattr(matisse, "is_lock_correction_on") and hasattr(matisse, "start_laser_lock_correction"):
-                if not matisse.is_lock_correction_on():
-                    matisse.start_laser_lock_correction()
+            print("Laser locked?:", matisse.laser_locked())
+        except Exception:
+            print("Laser locked?: (unknown)")
+
+        # Stop any running scan
+        try:
+            if matisse.is_scanning():
+                matisse.stop_scan()
         except Exception:
             pass
 
-        # SEEK if not within tolerance
-        wl_now = ws7_read_air_nm(ws7, ch2=args.ch2)
-        if wl_now > 0 and abs(wl_now - start_nm) > tol_nm:
-            wl_seek = seek_to_wavelength(
+        # -----------------------
+        # Pre-lock / align start
+        # -----------------------
+        print(f"\nPre-lock mode: {args.prelock}")
+        if args.prelock == "full":
+            print(f"Calling matisse.set_wavelength({start_nm:.6f}) ...")
+            matisse.set_wavelength(start_nm)
+
+        elif args.prelock == "stabilize":
+            # Ensure lock correction if your class supports it (optional)
+            try:
+                if hasattr(matisse, "is_lock_correction_on") and hasattr(matisse, "start_laser_lock_correction"):
+                    if not matisse.is_lock_correction_on():
+                        matisse.start_laser_lock_correction()
+            except Exception:
+                pass
+
+            # SEEK if not within tolerance
+            wl_now = ws7_read_air_nm(ws7, ch2=args.ch2)
+            if wl_now > 0 and abs(wl_now - start_nm) > tol_nm:
+                wl_seek = seek_to_wavelength(
+                    matisse=matisse,
+                    ws7=ws7,
+                    target_nm=start_nm,
+                    tol_nm=tol_nm,
+                    seek_speed_nm_s=args.seek_speed,
+                    timeout_s=args.seek_timeout,
+                    poll_dt_s=args.dt,
+                    ch2=args.ch2,
+                )
+                print(f"Seek result: WS7_air={wl_seek if wl_seek > 0 else None}")
+            else:
+                print("Already within tolerance; skipping SEEK.")
+
+            # Now stabilize at start
+            try:
+                matisse.target_wavelength = start_nm
+                matisse.stabilize_on()
+            except Exception:
+                pass
+
+        else:
+            # none
+            matisse.target_wavelength = start_nm
+
+        wl_start = ws7_read_air_nm(ws7, ch2=args.ch2)
+        print(f"\nStart check: WS7_air={wl_start if wl_start > 0 else None} (target {start_nm:.6f}±{tol_nm:.6f})")
+
+        # Turn OFF stabilization during scanning
+        try:
+            matisse.stabilize_off()
+        except Exception:
+            pass
+
+        # -----------------------
+        # Build scan plan
+        # -----------------------
+        segs = parse_segments(args.segments)
+        if not segs:
+            raise ValueError("No segments parsed.")
+
+        if args.relative:
+            plan = [(start_nm + d, sp) for (d, sp) in segs]
+        else:
+            plan = [(end, sp) for (end, sp) in segs]
+
+        # -----------------------
+        # Execute segments
+        # -----------------------
+        print("\n=== Running scan plan ===")
+        for i, (end_nm, sp) in enumerate(plan, start=1):
+            print(f"\n--- Segment {i}/{len(plan)} ---")
+            start_scan_to_target(
                 matisse=matisse,
                 ws7=ws7,
-                target_nm=start_nm,
+                end_nm=end_nm,
+                speed_nm_s=sp,
                 tol_nm=tol_nm,
-                seek_speed_nm_s=args.seek_speed,
-                timeout_s=args.seek_timeout,
                 poll_dt_s=args.dt,
                 ch2=args.ch2,
             )
-            print(f"Seek result: WS7_air={wl_seek if wl_seek>0 else None}")
-        else:
-            print("Already within tolerance; skipping SEEK.")
 
-        # Now stabilize at start
+        # Optional: re-stabilize at start
+        print("\nRe-stabilizing at start (optional)...")
         try:
             matisse.target_wavelength = start_nm
             matisse.stabilize_on()
+            time.sleep(1.0)
         except Exception:
             pass
 
-    else:
-        # none
-        matisse.target_wavelength = start_nm
+        print("\nDONE")
 
-    wl_start = ws7_read_air_nm(ws7, ch2=args.ch2)
-    print(f"\nStart check: WS7_air={wl_start if wl_start>0 else None} (target {start_nm:.6f}±{tol_nm:.6f})")
-
-    # Turn OFF stabilization during scanning
-    try:
-        matisse.stabilize_off()
-    except Exception:
-        pass
-
-    # -----------------------
-    # Build scan plan
-    # -----------------------
-    segs = parse_segments(args.segments)
-    if not segs:
-        raise ValueError("No segments parsed.")
-
-    if args.relative:
-        plan = [(start_nm + d, sp) for (d, sp) in segs]
-    else:
-        plan = [(end, sp) for (end, sp) in segs]
-
-    # -----------------------
-    # Execute segments
-    # -----------------------
-    print("\n=== Running scan plan ===")
-    for i, (end_nm, sp) in enumerate(plan, start=1):
-        print(f"\n--- Segment {i}/{len(plan)} ---")
-        start_scan_to_target(
-            matisse=matisse,
-            ws7=ws7,
-            end_nm=end_nm,
-            speed_nm_s=sp,
-            tol_nm=tol_nm,
-            poll_dt_s=args.dt,
-            ch2=args.ch2,
-        )
-
-    # Optional: re-stabilize at start
-    print("\nRe-stabilizing at start (optional)...")
-    try:
-        matisse.target_wavelength = start_nm
-        matisse.stabilize_on()
-        time.sleep(1.0)
-    except Exception:
-        pass
-
-    print("\nDONE")
+finally:
+        safe_stop_scan(matisse)
 
 
 if __name__ == "__main__":
