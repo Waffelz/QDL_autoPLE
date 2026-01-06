@@ -48,6 +48,10 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from pathlib import Path
+DEFAULT_CONFIG_PATH = str(Path(__file__).with_name("run_scan.yml"))
+
+
 # YAML
 try:
     import yaml
