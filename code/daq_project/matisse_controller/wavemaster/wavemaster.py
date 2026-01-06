@@ -8,19 +8,25 @@ import numpy as np
 import wlmData, wlmConst
 
 
+
 class WaveMeter:
     """An interface to serial port communication with the Coherent WaveMaster wavemeter."""
 
     wavemeter_lock = threading.Lock()
 
     def __init__(self, *args, **kwargs):
+        self.serial = None
         self.initialize(*args, **kwargs)
 
     def initialize(self, *args, **kwargs):
         warnings.warn('Set your own "initialize" class method.')
 
     def __del__(self):
-        warnings.warn('Set your own "delete" class method.')
+        try:
+            if getattr(self, "serial", None) is not None:
+                self.serial.close()
+        except Exception:
+            pass
 
     def query(self, command: str) -> str:
         """
