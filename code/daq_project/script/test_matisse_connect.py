@@ -34,7 +34,7 @@ def main():
     add_project_roots()
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", required=True, help="Windows COM port, e.g. COM6")
+    ap.add_argument("--resource", required=True, help="VISA resource, e.g. USB0::...::INSTR")
     args = ap.parse_args()
 
     print("Available COM ports:", list_com_ports())
