@@ -56,13 +56,11 @@ RunScan:
         exposure_s: 0.10         # integration window per point (seconds)
 
       andor_kinetic:
-        # Uses matisse_controller.shamrock_ple.ccd.CCD
-        exposure_s: 0.10
-        cycle_s: 0.12
-        n_frames: 800
-
-        cool_down: true
-        temperature_C: -70
+        temperature_C: -65
+        cool_down: false                 # don't wait at setup time
+        temperature_tolerance_C: 1.0
+        max_wait_for_temperature_s: 30   # set 0 to “don’t wait; just fail if warm”
+        cooler_persistence: true
 
         # These map into matisse_controller.shamrock_ple.constants READ_MODE_* and COSMIC_RAY_FILTER_*
         # Supported readout_mode strings in run_scan.py:
