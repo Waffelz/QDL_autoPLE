@@ -68,6 +68,70 @@ cReturnWavelengthVac = 0
 cReturnWavelengthAir = 1
 
 
+def estimate_hold_center_from_ws7(
+    t_ws7: np.ndarray,
+    wl_ws7: np.ndarray,
+    scan_speed_nm_s: float,
+    window_s: float = 0.25,
+    frac_of_scan_speed: float = 0.10,
+):
+    """
+    Estimate hold (plateau) center time directly from WS7 data by finding the longest
+    region where the measured slope is near zero.
+
+    Returns:
+      center_t, (t_start, t_end), debug_dict
+    """
+    t_ws7 = np.asarray(t_ws7, dtype=float)
+    wl_ws7 = np.asarray(wl_ws7, dtype=float)
+
+    # guard
+    if len(t_ws7) < 10:
+        raise ValueError("Not enough WS7 samples to estimate hold center.")
+
+    dt = np.median(np.diff(t_ws7))
+    win = max(5, int(round(window_s / max(dt, 1e-6))))
+
+    # finite-difference slope over a longer window to reduce WS7 quantization effects
+    denom = (t_ws7[win:] - t_ws7[:-win])
+    slope = (wl_ws7[win:] - wl_ws7[:-win]) / denom
+    t_slope = t_ws7[:-win] + 0.5 * denom
+
+    thr = frac_of_scan_speed * abs(scan_speed_nm_s)
+    mask = np.abs(slope) < thr
+
+    # longest contiguous run of True in mask
+    best = None
+    i = 0
+    while i < len(mask):
+        if mask[i]:
+            j = i
+            while j < len(mask) and mask[j]:
+                j += 1
+            if best is None or (j - i) > (best[1] - best[0]):
+                best = (i, j)
+            i = j
+        else:
+            i += 1
+
+    if best is None:
+        raise RuntimeError("Could not find a hold/plateau in WS7 slope data. Try longer hold_s.")
+
+    i0, i1 = best  # [i0, i1)
+    t0 = float(t_slope[i0])
+    t1 = float(t_slope[i1 - 1])
+    center = 0.5 * (t0 + t1)
+
+    dbg = {
+        "dt_med": float(dt),
+        "win_samples": int(win),
+        "slope_thr_nm_s": float(thr),
+        "run_len": int(i1 - i0),
+        "t0": t0,
+        "t1": t1,
+    }
+    return center, (t0, t1), dbg
+
 def bind_ws7_prototypes(lib) -> None:
     """Bind ctypes prototypes so ConvertUnit/GetWavelength return correct float types."""
     if hasattr(lib, "GetWavelength"):
