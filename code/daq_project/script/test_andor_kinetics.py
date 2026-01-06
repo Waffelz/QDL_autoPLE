@@ -4,24 +4,27 @@ test_andor_kinetics.py
 
 End-to-end test of Andor CCD kinetic series using matisse_controller.shamrock_ple.
 
-What it does:
-  - Loads Andor libs (CCD + Shamrock globals)
-  - Ensures cooler is ON and setpoint is applied (non-blocking)
-  - Optionally waits until temperature is cold enough
-  - Configures kinetics (n_frames, exposure, cycle)
-  - Runs acquisition (blocking until done)
-  - Saves a .sif file
-  - Prints timing + temperature before/after
+Run:
+  python script/test_andor_kinetics.py --exp 0.1 --cycle 0.12 --n 50 --out data/test_kinetics.sif
 
 IMPORTANT:
   - Close Andor Solis / any Andor GUI before running.
 """
 
 import os
+import sys
 import time
 import argparse
+from pathlib import Path
 
-from matisse_controller.shamrock_ple.ple import PLE, ccd, shamrock
+# --- Ensure project root is on sys.path so `import matisse_controller` works ---
+ROOT = Path(__file__).resolve().parents[1]  # .../daq_project
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from matisse_controller.shamrock_ple.ple import PLE
+import matisse_controller.shamrock_ple.ple as ple_mod
+
 from matisse_controller.shamrock_ple.constants import (
     READ_MODE_FVB,
     READ_MODE_SINGLE_TRACK,
@@ -63,16 +66,14 @@ def main():
     print("Loading Andor libs ...")
     PLE.load_andor_libs()
 
-    global ccd, shamrock
+    ccd = ple_mod.ccd
+    shamrock = ple_mod.shamrock  # may be None / unused in this test
     if ccd is None:
-        raise RuntimeError("CCD global is None after load_andor_libs().")
-    if shamrock is None:
-        print("Warning: Shamrock global is None (spectrograph not required for pure CCD kinetics test).")
+        raise RuntimeError("CCD global is None after PLE.load_andor_libs().")
 
-    # Keep cooling on across shutdowns
+    # Keep cooling on (non-blocking)
     ccd.ensure_cooling(args.temp, persist_on_shutdown=True)
 
-    # Optional wait for cold (slow)
     if args.wait:
         print(f"Waiting until CCD <= {args.temp}+{args.tol} C (timeout={args.wait_timeout}s)")
         ccd.wait_to_cooldown(target_C=args.temp, tol_C=args.tol, poll_s=5.0, timeout_s=args.wait_timeout)
@@ -83,8 +84,8 @@ def main():
     readout_mode = parse_readout_mode(args.readout)
     cosmic_mode = parse_cosmic(args.cosmic)
 
-    # Ensure output directory exists
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    out_path = Path(args.out).resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Configure kinetics (do NOT block on cooldown again)
     print("\nConfiguring kinetics...")
@@ -94,15 +95,14 @@ def main():
         n_frames=args.n,
         readout_mode=readout_mode,
         temperature=args.temp,
-        cool_down=False,                # <-- important: do not wait here
+        cool_down=False,  # important: don't wait here
         cosmic_ray_filter=cosmic_mode,
     )
 
     print(f"Kinetics configured: exp_actual={exp_actual:.6f}s, cycle_actual={cycle_actual:.6f}s")
-    est = args.n * cycle_actual
-    print(f"Estimated duration ~ {est:.3f}s for {args.n} frames")
+    print(f"Estimated duration ~ {args.n * cycle_actual:.3f}s for {args.n} frames")
 
-    # Start acquisition
+    # Acquire
     print("\nStarting acquisition...")
     t0 = time.time()
     ccd.start_acquisition()
@@ -110,34 +110,27 @@ def main():
     t1 = time.time()
     print(f"Acquisition finished in {t1 - t0:.3f}s")
 
-    # Save SIF (Andor SDK writes into current working dir if given a relative path)
-    out_path = os.path.abspath(args.out)
-    out_name = os.path.basename(out_path)
-
-    print(f"\nSaving SIF to {out_path}")
-    # SaveAsSif writes where filename points; some SDK builds require CWD write perms.
-    # Use a temp in CWD then move, for robustness:
-    tmp_name = out_name
+    # Save SIF robustly: write to CWD then move
+    tmp_name = out_path.name
+    print(f"\nSaving SIF (tmp) to {Path.cwd() / tmp_name}")
     ccd.save_as_sif(tmp_name)
 
-    # Move to desired output folder if needed
-    if os.path.abspath(tmp_name) != out_path:
-        if os.path.exists(out_path):
-            os.remove(out_path)
-        os.replace(tmp_name, out_path)
+    # Move into desired folder
+    if out_path.exists():
+        out_path.unlink()
+    os.replace(str(Path.cwd() / tmp_name), str(out_path))
 
     temp_after = ccd.get_temperature()
     print(f"CCD temperature after acquisition: {temp_after:.1f} C")
+    print(f"\nSaved SIF: {out_path}")
 
-    print("\nDONE. If you see a valid .sif and no SDK errors, kinetics path is good.")
+    print("\nDONE.")
 
-    # Important: do NOT force cooler off here
-    # Clean up globals (will call shutdown; our CCD.shutdown honors keep_cooler_on if set)
+    # Clean up globals (your updated CCD can keep cooler on depending on settings)
     try:
         PLE.clean_up_globals()
     except Exception:
         pass
-
 
 if __name__ == "__main__":
     main()
