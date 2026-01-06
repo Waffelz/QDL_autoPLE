@@ -1,14 +1,24 @@
-scan:
-  start_nm: 737.000
-  end_nm: 739.000
-  speed: 0.5          # whatever your Matisse driver expects
-  exposure_s: 0.10
-  wl_sample_period_s: 0.02
-  stop_margin_nm: 0.000
+RunScan:
+  scan:
+    start_nm: 739.50
+    end_nm: 739.55
+    auto_scan_speed_from_kinetic: true
+    ws7_sample_period_s: 0.02
+    power_sample_period_s: 0.05
+    max_run_time_s: 600
 
-detector:
-  kind: "counts"      # "counts" or "spectrum"
-  # for spectrum you’ll also provide axis in code or load from a file
+  instruments:
+    detector:
+      mode: "andor_kinetic"
+      andor_kinetic:
+        exposure_s: 0.10
+        cycle_s: 0.15
+        n_frames: 200
+        cool_down: false           # since you keep cooler on
+        temperature_C: -65
+
 
 output:
   path: "data/scan_001.h5"
+
+

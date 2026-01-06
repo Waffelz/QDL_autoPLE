@@ -1,79 +1,70 @@
-# configs/run_scan.yml
 RunScan:
   output:
     directory: "data"
-    basename: "scan_737_to_739"
+    basename: "goalA_andor_ws7_power_sync"
     format: "h5"          # "h5" or "npz"
     overwrite: true
     save_meta_json: true
 
   scan:
-    start_nm: 737.0
-    end_nm: 739.0
+    # For Goal A, we do NOT scan Matisse yet:
+    enable_matisse: false
 
-    # Sampling for calibration traces (these run during the scan / kinetic series)
+    # Still keep start/end for later (Goal B)
+    start_nm: 739.302
+    end_nm: 739.310
+
     ws7_sample_period_s: 0.02
     power_sample_period_s: 0.05
 
-    # If true (recommended for Andor kinetics), scan_speed_nm_per_s is computed from:
-    #   duration = n_frames * cycle_s_actual
-    # so the wavemeter/power traces end when the kinetic series ends.
     auto_scan_speed_from_kinetic: true
+    scan_speed_nm_per_s: 0.005   # used only when enable_matisse=true and auto=false
 
-    # Used only if auto_scan_speed_from_kinetic=false
-    scan_speed_nm_per_s: 0.005
-
-    max_run_time_s: 600
-
-    # Optional: stop slightly before/after end_nm.
-    # For upward scan, stop_wl = end_nm - stop_margin_nm
-    # For downward scan, stop_wl = end_nm + stop_margin_nm
-    stop_margin_nm: 0.0
+    max_run_time_s: 300
 
   instruments:
-    wavemeter:
-      type: "WS7"
+    # These import paths/class names match your working test scripts.
+    # If your class names differ, only edit import_path/class_name/init_kwargs.
 
-    matisse:
-      wavemeter_type: "WS7"
+    ws7:
+      enabled: true
+      import_path: "functions26.instruments.ws7"
+      class_name: "WS7"
+      init_kwargs: {}
 
     powermeter:
       enabled: true
-      channel: "A"               # "A", "B", or "AB"
+      import_path: "functions26.instruments.powermeter"
+      class_name: "PowerMeter"
+      init_kwargs:
+        channel: "A"
+
+    # Leave disabled for Goal A
+    matisse:
+      enabled: false
+      # (Fill these when you do Goal B)
+      import_path: "YOUR_MATISSE_IMPORT_PATH"
+      class_name: "YOUR_MATISSE_CLASS"
+      init_kwargs: {}
 
     detector:
-      # Choose one:
-      #   "timetagger_counts"  -> count photons per exposure window (continuous scan)
-      #   "andor_kinetic"      -> kinetic series (.sif) + matched wavemeter/power traces
       mode: "andor_kinetic"
 
-      timetagger_counts:
-        serial: null
-        click:
-          physical_channel: 1
-          trigger_v: -0.08
-          edge: "falling"        # negative-going pulse -> usually falling edge
-        exposure_s: 0.10         # integration window per point (seconds)
-
       andor_kinetic:
+        exposure_s: 0.10
+        cycle_s: 0.12
+        n_frames: 50
+
+        # Cooling strategy:
         temperature_C: -65
-        cool_down: false                 # don't wait at setup time
+        cool_down: false              # don't block-wait every run
+        require_temperature: true     # refuse to acquire if too warm
         temperature_tolerance_C: 1.0
-        max_wait_for_temperature_s: 30   # set 0 to “don’t wait; just fail if warm”
-        cooler_persistence: true
+        temperature_timeout_s: 5.0    # quick wait/check (0.0 = immediate check)
 
-        # These map into matisse_controller.shamrock_ple.constants READ_MODE_* and COSMIC_RAY_FILTER_*
-        # Supported readout_mode strings in run_scan.py:
-        #   FVB, SINGLE_TRACK, MULTI_TRACK, RANDOM_TRACK, IMAGE
         readout_mode: "FVB"
-
-        # bool (preferred) or ON/OFF
         cosmic_ray_filter: true
 
-        # Reserved for future optional passthroughs; currently run_scan.py only uses the above keys.
-        ccd_kwargs: {}
-
   metadata:
-    sample: "ZnO Sn-Li donor"
     operator: "Xingyi"
-    note: "Continuous scan with selectable detector (TimeTagger counts or Andor kinetics)."
+    note: "Goal A: Andor kinetics + WS7 + power alignment (no Matisse scan)"
