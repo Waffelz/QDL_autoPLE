@@ -1,0 +1,46 @@
+mode: andor_kinetic
+
+scan:
+  start_nm: 739.300000
+  end_nm:   739.302000
+  ws7_sample_period_s: 0.02
+  ws7_ch2: false
+
+  # optional but recommended
+  prelock: stabilize
+  start_tolerance_nm: 0.00005
+  stabilize_settle_s: 0.5
+  seek_timeout_s: 120
+  seek_coarse_speed_nm_per_s: 0.01
+  seek_fine_speed_nm_per_s: 0.0005
+  seek_fine_window_nm: 0.001
+
+  auto_scan_speed_from_kinetic: true
+  max_run_time_s: 120
+
+output:
+  directory: data
+  basename: andor_kinetic_smoketest
+  format: h5
+  overwrite: true
+  save_meta_json: true
+
+instruments:
+  detector:
+    andor_kinetic:
+      exposure_s: 0.10
+      cycle_s: 0.12
+      n_frames: 20
+
+      temperature_C: -65
+      wait_for_cooldown: false
+      temp_tol_C: 1.0
+      wait_timeout_s: 1800
+      persist_cooling_on_shutdown: true
+
+      readout_mode: FVB
+      cosmic_ray_filter: true
+
+  powermeter:
+    enabled: false
+    channel: B

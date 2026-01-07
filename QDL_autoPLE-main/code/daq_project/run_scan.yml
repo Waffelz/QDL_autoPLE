@@ -1,0 +1,110 @@
+RunScan:
+
+  # ---------------------------
+  # Output / saving
+  # ---------------------------
+  output:
+    directory: data
+    basename: scan_test
+    format: h5          # h5 or npz
+    overwrite: true
+    save_meta_json: true
+
+  # ---------------------------
+  # Scan settings (shared)
+  # ---------------------------
+  scan:
+    # start alignment + seeking
+    start_nm: 739.300
+    prelock: stabilize          # none | stabilize | full
+    start_tolerance_nm: 0.00005
+    stabilize_settle_s: 0.5
+
+    # seek behavior
+    seek_timeout_s: 90.0
+    seek_coarse_speed_nm_per_s: 0.01
+    seek_fine_speed_nm_per_s: 0.0005
+    seek_fine_window_nm: 0.001
+    poll_dt_s: 0.05
+
+    # wavemeter sampling
+    ws7_sample_period_s: 0.02
+    ws7_ch2: false
+
+    #  power sampling (used in kinetic mode; counts mode can use it too if enabled)
+    power_sample_period_s: 0.05
+
+    # runtime safety
+    max_run_time_s: 900.0
+
+    # ---------
+    # Piecewise scan plan (for timetagger_counts mode)
+    # ---------
+    # If segments is set, run_scan_timetagger_counts will use it.
+    # If segments is omitted, it can fall back to end_nm + default scan_speed.
+    relative: false
+    end_nm: 739.305
+    scan_speed_nm_per_s: 0.002
+    segments: "739.302,0.002;739.303,0.0005;739.305,0.002"
+
+  # ---------------------------
+  # Instruments
+  # ---------------------------
+  instruments:
+
+    # Toggle whether power is recorded
+    powermeter:
+      enabled: true
+      channel: B
+
+    detector:
+      # CHANGE ONLY THIS LINE to switch mode:
+      #   timetagger_counts  -> TimeTagger counting scan
+      #   andor_kinetic      -> Andor kinetics scan
+      mode: andor_kinetic
+
+      # ---- Mode A: TimeTagger counts ----
+      timetagger_counts:
+        exposure_s: 1.0
+        serial: null          # or "TT12345" if you use a specific serial
+        click:
+          physical_channel: 1
+          trigger_v: -0.08
+          edge: falling
+
+      # ---- Mode B: Andor kinetic ----
+      andor_kinetic:
+        # ---- cooling behavior (like your working test_andor_kinetics.py) ----
+        temperature_C: -65.0
+        temp_tol_C: 1.0
+        wait_for_cooldown: false
+        wait_timeout_s: 1800.0
+        persist_cooling_on_shutdown: true
+
+        # ---- kinetics timing ----
+        exposure_s: 0.10
+        cycle_s: 0.12
+        n_frames: 50
+
+        # ---- basic Andor options your run_scan currently understands ----
+        readout_mode: FVB               # FVB | SINGLE_TRACK (per your parser)
+        cosmic_ray_filter: ON           # ON/OFF (or true/false)
+
+        # ---- optional: park legacy knobs here for future wiring ----
+        legacy_config:
+          ccd_device_index: 0
+          spg_device_index: 0
+          grating: null
+          center_wavelength_nm: 370
+          input_port: SIDE
+          output_port: DIRECT
+          trigger_mode: INTERNAL
+          baseline_clamp: true
+          keep_clean_on_external_trigger: true
+          single_track_center_row: null
+          single_track_height: null
+          vertical_shift_speed: null
+          horizontal_shift_speed: [ 0, 0, 0.05 ]
+          pre_amp_gain: null
+
+
