@@ -153,17 +153,17 @@ def start_midpoint_power_read(powermeter_instance, exposure_s: float) -> Tuple[t
     return th, out
 
 def load_config(path: str) -> Dict[str, Any]:
-    try:
-        import yaml
-    except ImportError as e:
-        raise RuntimeError("Missing dependency: pyyaml. Install with: pip install pyyaml") from e
-
     with open(path, "r") as f:
         top = yaml.safe_load(f) or {}
+
     cfg = top.get("RunScan", {})
     if not cfg:
         raise ValueError("YAML missing top-level key: RunScan")
+
+    # Keep entire YAML so we can read legacy PLEScan fields too
+    cfg["_full_yaml"] = top
     return cfg
+
 
 
 def cfg_get(d: Dict[str, Any], path: str, default=None):
@@ -175,6 +175,136 @@ def cfg_get(d: Dict[str, Any], path: str, default=None):
         cur = cur[part]
     return cur
 
+
+def enforce_horizontal_shift_speed(ccd, hss=(0, 0, 0.05)) -> None:
+    """
+    Force Andor horizontal shift speed using the underlying Andor SDK functions.
+
+    hss = (ad_channel, output_amp, speed_MHz)
+      - ad_channel: int (usually 0)
+      - output_amp: int (usually 0)
+      - speed_MHz: float (e.g. 0.05)
+
+    This maps speed_MHz -> closest available HSSpeed index, then calls SetHSSpeed().
+    """
+    import ctypes
+
+    ad_ch, out_amp, target_mhz = int(hss[0]), int(hss[1]), float(hss[2])
+
+    # Try common attribute names where the ctypes DLL handle might live
+    sdk = (
+        getattr(ccd, "atmcd", None)
+        or getattr(ccd, "_atmcd", None)
+        or getattr(ccd, "lib", None)
+        or getattr(ccd, "_lib", None)
+        or getattr(ccd, "dll", None)
+        or getattr(ccd, "_dll", None)
+        or getattr(ccd, "andor", None)
+        or getattr(ccd, "_andor", None)
+    )
+
+    if sdk is None:
+        raise RuntimeError(
+            "Can't locate the Andor SDK DLL handle inside `ccd`. "
+            "Print attributes like `dir(ccd)` and look for atmcd/lib/dll."
+        )
+
+    def has(name: str) -> bool:
+        return hasattr(sdk, name)
+
+    def call(name: str, *args):
+        fn = getattr(sdk, name, None)
+        if fn is None:
+            return None
+        try:
+            return fn(*args)
+        except Exception:
+            return None
+
+    # Sanity: these are the key SDK functions we rely on
+    needed = ("GetNumberHSSpeeds", "GetHSSpeed", "SetHSSpeed")
+    if not all(has(n) for n in needed):
+        raise RuntimeError(
+            f"Andor SDK handle found, but missing required functions: "
+            f"{[n for n in needed if not has(n)]}. "
+            "Your wrapper may be using a different API surface."
+        )
+
+    # Set AD channel + output amplifier if available
+    if has("SetADChannel"):
+        call("SetADChannel", ctypes.c_int(ad_ch))
+    if has("SetOutputAmplifier"):
+        call("SetOutputAmplifier", ctypes.c_int(out_amp))
+
+    # Enumerate available HS speeds and pick closest to target_mhz
+    n = ctypes.c_int()
+    # Andor signature: GetNumberHSSpeeds(int channel, int typ, int* speeds)
+    call("GetNumberHSSpeeds", ctypes.c_int(ad_ch), ctypes.c_int(out_amp), ctypes.byref(n))
+
+    if n.value <= 0:
+        raise RuntimeError(f"GetNumberHSSpeeds returned n={n.value}. Cannot set HS speed.")
+
+    best_i = 0
+    best_speed = None
+    best_diff = float("inf")
+
+    for i in range(n.value):
+        sp = ctypes.c_float()
+        # Andor signature: GetHSSpeed(int channel, int typ, int index, float* speed)
+        call("GetHSSpeed", ctypes.c_int(ad_ch), ctypes.c_int(out_amp), ctypes.c_int(i), ctypes.byref(sp))
+        diff = abs(float(sp.value) - target_mhz)
+        if diff < best_diff:
+            best_diff = diff
+            best_i = i
+            best_speed = float(sp.value)
+
+    # Andor signature: SetHSSpeed(int typ, int index)   (typ == output amplifier)
+    call("SetHSSpeed", ctypes.c_int(out_amp), ctypes.c_int(best_i))
+
+    print(
+        f"Enforced horizontal_shift_speed: (AD={ad_ch}, AMP={out_amp}, target={target_mhz} MHz) "
+        f"-> index={best_i}, actual={best_speed} MHz"
+    )
+
+def stop_stabilization_everywhere(matisse):
+    # 1) turn off stabilize mode if it exists
+    try:
+        matisse.stabilize_off()
+    except Exception:
+        pass
+
+    # 2) common method names
+    for name in (
+        "stop_stabilization_thread",
+        "stop_stabilisation_thread",
+        "stop_stabilization",
+        "stop_stabilisation",
+    ):
+        if hasattr(matisse, name):
+            try:
+                getattr(matisse, name)()
+                return
+            except Exception:
+                pass
+
+    # 3) common attribute names (thread object)
+    th = None
+    for attr in ("stabilization_thread", "_stabilization_thread", "stab_thread", "_stab_thread"):
+        if hasattr(matisse, attr):
+            th = getattr(matisse, attr)
+            break
+
+    if th is not None:
+        try:
+            if hasattr(th, "stop"):
+                th.stop()
+        except Exception:
+            pass
+        try:
+            if hasattr(th, "join"):
+                th.join(timeout=2.0)
+        except Exception:
+            pass
 
 # -------------------------
 # WS7 helpers (AIR)
@@ -1164,68 +1294,29 @@ def run_scan_timetagger_counts(cfg: Dict[str, Any]) -> None:
 # -------------------------
 # Mode 2: Andor kinetic series (kept similar, WS7 AIR sampling)
 # -------------------------
-def run_scan_andor_kinetic(cfg: Dict[str, Any]) -> None:
+def run_scan_andor_kinetic(cfg: Dict[str, Any], top_cfg: Optional[Dict[str, Any]] = None) -> None:
+
+    import os, time, json, shutil, threading
+    import numpy as np
     import matisse_controller.shamrock_ple.ple as ple_mod
-    from matisse_controller.shamrock_ple.constants import (
-        READ_MODE_FVB,
-        READ_MODE_SINGLE_TRACK,
-        READ_MODE_MULTI_TRACK,
-        READ_MODE_RANDOM_TRACK,
-        READ_MODE_IMAGE,
-        COSMIC_RAY_FILTER_ON,
-        COSMIC_RAY_FILTER_OFF,
-    )
 
-    # IMPORTANT: make sure you have this import available in run_scan.py
-    from functions26.instruments.powermeter import PowerMeter
-
-    def parse_andor_readout_mode(mode) -> int:
-        if mode is None:
-            return READ_MODE_FVB
-        if isinstance(mode, (int, float)):
-            return int(mode)
-        s = str(mode).strip().upper()
-        mapping = {
-            "FVB": READ_MODE_FVB,
-            "SINGLE_TRACK": READ_MODE_SINGLE_TRACK,
-            "SINGLETRACK": READ_MODE_SINGLE_TRACK,
-            "MULTI_TRACK": READ_MODE_MULTI_TRACK,
-            "MULTITRACK": READ_MODE_MULTI_TRACK,
-            "RANDOM_TRACK": READ_MODE_RANDOM_TRACK,
-            "RANDOMTRACK": READ_MODE_RANDOM_TRACK,
-            "IMAGE": READ_MODE_IMAGE,
-        }
-        if s in mapping:
-            return mapping[s]
-        raise ValueError(f"Unknown Andor readout_mode: {mode!r}")
-
-    def parse_cosmic_ray_filter(val) -> int:
-        if val is None:
-            return COSMIC_RAY_FILTER_ON
-        if isinstance(val, bool):
-            return COSMIC_RAY_FILTER_ON if val else COSMIC_RAY_FILTER_OFF
-        if isinstance(val, (int, float)):
-            return int(val)
-        s = str(val).strip().upper()
-        if s in ("ON", "TRUE", "1", "YES"):
-            return COSMIC_RAY_FILTER_ON
-        if s in ("OFF", "FALSE", "0", "NO"):
-            return COSMIC_RAY_FILTER_OFF
-        raise ValueError(f"Unknown cosmic_ray_filter: {val!r}")
-
-    def frame_windows(t0: float, exposure_s: float, cycle_s: float, n_frames: int) -> List[Tuple[float, float]]:
-        return [(t0 + i * cycle_s, t0 + i * cycle_s + exposure_s) for i in range(n_frames)]
+    # ---------- helpers ----------
+    def cfg_get(d, path, default=None):
+        cur = d
+        for part in path.split("."):
+            if not isinstance(cur, dict) or part not in cur:
+                return default
+            cur = cur[part]
+        return cur
 
     def wait_for_ccd_with_timeout(ccd, timeout_s: float) -> bool:
         done = {"ok": False}
-
         def worker():
             try:
                 ccd.wait_for_acquisition()
                 done["ok"] = True
             except Exception:
                 done["ok"] = False
-
         th = threading.Thread(target=worker, daemon=True)
         th.start()
         th.join(timeout=max(0.0, float(timeout_s)))
@@ -1238,150 +1329,321 @@ def run_scan_andor_kinetic(cfg: Dict[str, Any]) -> None:
             return False
         return bool(done["ok"])
 
-    # --- NEW: detect scan direction mapping (dir_up/dir_down) ---
-    def detect_dir_up(matisse, ws7, ch2: bool, tap_s: float = 0.5, speed_nm_s: float = 0.01) -> int:
+    def frame_windows(t0: float, exposure_s: float, cycle_s: float, n_frames: int):
+        return [(t0 + i * cycle_s, t0 + i * cycle_s + exposure_s) for i in range(n_frames)]
+
+
+    def get_horizontal_shift_speed_from_yaml(top_cfg: Dict[str, Any]) -> Optional[Tuple[int, int, float]]:
         """
-        Returns dir_up: the SCAN dir (0/1) that increases WS7 wavelength.
-        Falls back to 0 if not confident.
+        Supports legacy location:
+          PLEScan: DAQController: configure: horizontal_shift_speed: [AD, AMP, MHz]
         """
         try:
-            set_scan_speed(matisse, abs(speed_nm_s))
+            hss = top_cfg.get("PLEScan", {}).get("DAQController", {}).get("configure", {}).get("horizontal_shift_speed",
+                                                                                               None)
+            if hss is None:
+                return None
+            ad, amp, mhz = hss
+            return int(ad), int(amp), float(mhz)
+        except Exception:
+            return None
+
+    def ensure_lock_and_loops():
+        # Match the behavior that made SCAN responsive in timetagger mode
+        try:
+            # some versions expose "start_laser_lock()" instead of correction
+            if hasattr(matisse, "start_laser_lock"):
+                matisse.start_laser_lock()
         except Exception:
             pass
 
-        wl0 = ws7_read_air_nm(ws7, ch2=ch2)
-        if wl0 <= 0:
-            return 0
+        try:
+            if hasattr(matisse, "start_laser_lock_correction"):
+                matisse.start_laser_lock_correction()
+        except Exception:
+            pass
 
-        deltas = {}
-        for d in (0, 1):
-            safe_stop_scan(matisse)
-            matisse.start_scan(int(d))
-            time.sleep(max(0.2, tap_s))
-            safe_stop_scan(matisse)
-            wl1 = ws7_read_air_nm(ws7, ch2=ch2)
-            if wl1 > 0:
-                deltas[d] = wl1 - wl0
-            time.sleep(0.1)
+        try:
+            if hasattr(matisse, "start_control_loops"):
+                matisse.start_control_loops()
+        except Exception:
+            pass
 
-        if 0 in deltas and 1 in deltas:
-            # pick the direction with the larger positive delta
-            if deltas[0] == deltas[1]:
-                return 0
-            return 0 if deltas[0] > deltas[1] else 1
-
-        return 0
-
-    # ------------------------
-    # config
-    # ------------------------
+    # ---------- config ----------
     scan = cfg["scan"]
     out = cfg["output"]
     inst = cfg["instruments"]
     det = inst["detector"]["andor_kinetic"]
 
     start_nm = float(scan["start_nm"])
-    end_nm = float(scan["end_nm"])
+    end_nm   = float(scan["end_nm"])
+
     ws7_dt = float(scan.get("ws7_sample_period_s", 0.02))
-    ch2 = bool(scan.get("ws7_ch2", False))
-
-    # NEW: power sampler
-    pow_cfg = inst.get("powermeter", {}) or {}
-    pow_enabled = bool(pow_cfg.get("enabled", False))
-    pow_channel = str(pow_cfg.get("channel", "A"))
-    pm_dt = float(scan.get("power_sample_period_s", 0.05))
-
+    pm_dt  = float(scan.get("power_sample_period_s", 0.05))
     max_run_time_s = float(scan.get("max_run_time_s", 600))
 
-    # optional: same prelock/seek knobs as timetagger mode
-    prelock = str(scan.get("prelock", "stabilize")).strip().lower()
-    tol_nm = float(scan.get("start_tolerance_nm", 0.00005))
-    stabilize_settle_s = float(scan.get("stabilize_settle_s", 0.5))
-    poll_dt_s = float(scan.get("poll_dt_s", 0.05))
-    seek_timeout_s = float(scan.get("seek_timeout_s", 120.0))
-    seek_coarse_speed = float(scan.get("seek_coarse_speed_nm_per_s", 0.01))
-    seek_fine_speed = float(scan.get("seek_fine_speed_nm_per_s", 0.0005))
-    seek_fine_window = float(scan.get("seek_fine_window_nm", 0.001))
-
+    # kinetics
     exposure_s_req = float(det["exposure_s"])
-    cycle_s_req = float(det["cycle_s"])
-    n_frames = int(det["n_frames"])
+    cycle_s_req    = float(det["cycle_s"])
+    n_frames       = int(det["n_frames"])
 
-    temperature_C = float(det.get("temperature_C", -65.0))
-    wait_for_cooldown = bool(det.get("wait_for_cooldown", False))
-    temp_tol_C = float(det.get("temp_tol_C", 1.0))
-    wait_timeout_s = float(det.get("wait_timeout_s", 1800.0))
-    persist_cooling = bool(det.get("persist_cooling_on_shutdown", True))
+    # temp/cooling keys (support both new + “old” names)
+    temperature_C = float(det.get("temperature_C", det.get("target_sensor_temperature", -65.0)))
+    temp_tol_C    = float(det.get("temp_tol_C", det.get("tol_C", det.get("temperature_tolerance_C", 1.0))))
+    wait_for_cooldown = bool(det.get("wait_for_cooldown", det.get("reach_temperature_before_acquisition", False)))
+    wait_timeout_s = float(det.get("wait_timeout_s", det.get("wait_timeout", 1800)))
+    persist_cooling = bool(det.get("persist_cooling_on_shutdown", det.get("cooler_persistence", True)))
 
-    ccd_kwargs = det.get("ccd_kwargs", {}) or {}
-    readout_mode = parse_andor_readout_mode(det.get("readout_mode", ccd_kwargs.get("readout_mode", "FVB")))
-    cosmic_ray_filter = parse_cosmic_ray_filter(det.get("cosmic_ray_filter", ccd_kwargs.get("cosmic_ray_filter", True)))
-
+    # scan speed
     auto_speed = bool(scan.get("auto_scan_speed_from_kinetic", True))
     manual_speed = float(scan.get("scan_speed_nm_per_s", scan.get("scan_speed", 0.005)))
 
+    # output
     out_dir = out.get("directory", "data")
-    base = out.get("basename", "scan")
+    base = out.get("basename", "andor_kinetic")
     fmt = out.get("format", "h5").lower()
     overwrite = bool(out.get("overwrite", True))
     save_meta = bool(out.get("save_meta_json", True))
 
     os.makedirs(out_dir, exist_ok=True)
-    sif_path = os.path.join(out_dir, f"{base}.sif")
+    sif_path  = os.path.join(out_dir, f"{base}.sif")
     meta_path = os.path.join(out_dir, f"{base}.meta.json")
-    data_path = os.path.join(out_dir, f"{base}.{ 'h5' if fmt == 'h5' else 'npz' }")
+    data_path = os.path.join(out_dir, f"{base}.{'h5' if fmt=='h5' else 'npz'}")
 
     if (not overwrite) and (os.path.exists(sif_path) or os.path.exists(data_path)):
         raise FileExistsError(f"Output exists and overwrite=false: {sif_path} / {data_path}")
 
-    # ------------------------
-    # setup instruments
-    # ------------------------
-    ple = ple_mod.PLE(matisse=None)  # matches your local PLE signature; keep as you currently do
+    from matisse_controller.shamrock_ple.constants import (
+        READ_MODE_FVB,
+        READ_MODE_SINGLE_TRACK,
+        COSMIC_RAY_FILTER_ON,
+        COSMIC_RAY_FILTER_OFF,
+    )
 
-    ple.setup_ws7()
-    ple.setup_andor()
-    ple.setup_matisse("WS7", scanning_speed=None)
-    ple._setup_wavelength_tolerance("WS7")
+    def parse_andor_readout_mode(mode) -> int:
+        # Accept strings, bool/int, None
+        if mode is None:
+            return READ_MODE_FVB
+        if isinstance(mode, (int, np.integer)):
+            return int(mode)
+        s = str(mode).strip().upper()
+        if s == "FVB":
+            return READ_MODE_FVB
+        if s in ("SINGLE_TRACK", "SINGLETRACK"):
+            return READ_MODE_SINGLE_TRACK
+        raise ValueError(f"Unknown Andor readout_mode: {mode!r}")
 
-    ws7 = ple_mod.ws7
-    ccd = ple_mod.ccd
-    spectrograph = ple_mod.spectrograph
-    matisse = ple_mod.matisse
+    def parse_cosmic_ray_filter(val) -> int:
+        if val is None:
+            return COSMIC_RAY_FILTER_ON
+        if isinstance(val, bool):
+            return COSMIC_RAY_FILTER_ON if val else COSMIC_RAY_FILTER_OFF
+        if isinstance(val, (int, np.integer)):
+            return int(val)
+        s = str(val).strip().upper()
+        if s in ("ON", "TRUE", "1", "YES"):
+            return COSMIC_RAY_FILTER_ON
+        if s in ("OFF", "FALSE", "0", "NO"):
+            return COSMIC_RAY_FILTER_OFF
+        raise ValueError(f"Unknown cosmic_ray_filter: {val!r}")
 
-    if ws7 is None or ccd is None or spectrograph is None or matisse is None:
-        raise RuntimeError("Setup failed: ws7/ccd/spectrograph/matisse is None after setup.")
-
+    # ---------- connect WS7 ----------
+    print("Connecting WS7...")
+    ws7 = WS7()
     bind_ws7_prototypes(ws7.lib)
+    wl_now = ws7_read_air_nm(ws7, ch2=bool(scan.get("ws7_ch2", False)))
+    print(f"WS7 OK. Current WS7_air={wl_now if wl_now>0 else None}")
 
-    # ------------------------
-    # cooling behavior (like your working test_andor_kinetics)
-    # ------------------------
+    # ---------- connect Matisse ----------
+    print("\nConnecting Matisse...")
+    matisse = Matisse(wavemeter_type="WS7")
+    print("Matisse OK.")
     try:
-        if hasattr(ccd, "ensure_cooling"):
-            ccd.ensure_cooling(temperature_C, persist_on_shutdown=persist_cooling)
+        print("Laser locked?:", matisse.laser_locked())
+    except Exception:
+        print("Laser locked?: (unknown)")
 
-        if wait_for_cooldown and hasattr(ccd, "wait_to_cooldown"):
-            print(f"Waiting for CCD <= {temperature_C}+{temp_tol_C} C (timeout={wait_timeout_s}s)")
-            ccd.wait_to_cooldown(target_C=temperature_C, tol_C=temp_tol_C, poll_s=5.0, timeout_s=wait_timeout_s)
+    # ---------- load Andor libs  ----------
+    print("\nLoading Andor libs ...")
+    # Some versions allow device indexes; try, then fallback:
+    ccd_device_index = cfg_get(cfg, "PLEScan.DAQController.configure.ccd_device_index", None)
+    spg_device_index = cfg_get(cfg, "PLEScan.DAQController.configure.spg_device_index", None)
+    try:
+        if ccd_device_index is not None or spg_device_index is not None:
+            ple_mod.PLE.load_andor_libs(ccd_device_index=ccd_device_index, spg_device_index=spg_device_index)
         else:
-            if hasattr(ccd, "wait_until_cold"):
-                t_now = ccd.wait_until_cold(temperature_C, tol_C=temp_tol_C, timeout_s=0.0)
-                print(f"Temp check (non-blocking): CCD temp = {t_now:.1f} C")
-    except Exception as e:
-        print(f"(warning) cooling setup skipped/failed: {e}")
+            ple_mod.PLE.load_andor_libs()
+    except TypeError:
+        ple_mod.PLE.load_andor_libs()
 
-    # ------------------------
-    # prelock/align start (optional but recommended)
-    # ------------------------
+    ccd = ple_mod.ccd
+    shamrock = getattr(ple_mod, "shamrock", None)  # may be None
+    if ccd is None:
+        raise RuntimeError("CCD global is None after PLE.load_andor_libs().")
+
+    # ---------- cooling (match your working test) ----------
+    try:
+        ccd.ensure_cooling(temperature_C, persist_on_shutdown=persist_cooling)
+    except Exception as e:
+        print(f"WARNING: ensure_cooling failed: {e}")
+
+    if wait_for_cooldown:
+        print(f"Waiting for CCD to reach {temperature_C}±{temp_tol_C} C (timeout={wait_timeout_s}s)")
+        try:
+            ccd.wait_to_cooldown(target_C=temperature_C, tol_C=temp_tol_C, poll_s=5.0, timeout_s=wait_timeout_s)
+        except Exception as e:
+            raise RuntimeError(f"Cooldown wait failed: {e}")
+    else:
+        try:
+            t_now = ccd.wait_until_cold(temperature_C, tol_C=temp_tol_C, timeout_s=0.0)
+            print(f"Temp check (non-blocking): current CCD temp = {t_now:.1f} C")
+        except Exception:
+            pass
+
+    #enforce horizontal shift speed
+    # -----------------------------
+    # Enforce horizontal shift speed
+    # -----------------------------
+    full = cfg.get("_full_yaml", {})
+
+    legacy_hss = (
+        (((full.get("PLEScan") or {}).get("DAQController") or {}).get("configure") or {})
+        .get("horizontal_shift_speed", None)
+    )
+
+    yaml_hss = det.get("horizontal_shift_speed", None)  # if you also allow it in RunScan
+
+    # Always enforce to the known-good setting
+    HSS_ENFORCED = (0, 0, 0.05)
+
+    if yaml_hss is not None and tuple(yaml_hss) != HSS_ENFORCED:
+        print(f"WARNING: overriding RunScan horizontal_shift_speed={yaml_hss} -> {HSS_ENFORCED}")
+    if legacy_hss is not None and tuple(legacy_hss) != HSS_ENFORCED:
+        print(f"WARNING: overriding PLEScan horizontal_shift_speed={legacy_hss} -> {HSS_ENFORCED}")
+
+    def _set_horizontal_shift_speed(ccd_obj, hss_tuple):
+        # Try common method names (depends on your CCD wrapper)
+        for name in (
+                "set_horizontal_shift_speed",
+                "set_horiz_shift_speed",
+                "set_hs_speed",
+                "setHorizontalShiftSpeed",
+        ):
+            if hasattr(ccd_obj, name):
+                getattr(ccd_obj, name)(hss_tuple)
+                return True
+        return False
+
+    ok = _set_horizontal_shift_speed(ccd, HSS_ENFORCED)
+    if ok:
+        print(f"CCD horizontal_shift_speed enforced: {HSS_ENFORCED}")
+    # else:
+        # raise RuntimeError(
+        #     "Your CCD wrapper doesn't expose a setter like set_horizontal_shift_speed(...). "
+        #     "Add a method for it (recommended), or expose it through setup_kinetics in the wrapper."
+        # )
+
+    # ---------- optional shamrock config from old YAML ----------
+    # Only apply if device exposes methods; otherwise just store in meta.
+    old_cfg = cfg_get(cfg, "PLEScan.DAQController.configure", {}) or {}
+    try:
+        if shamrock is not None:
+            center_wl = old_cfg.get("center_wavelength", None)
+            if center_wl is not None and hasattr(shamrock, "set_wavelength"):
+                shamrock.set_wavelength(float(center_wl))
+            grating = old_cfg.get("grating", None)
+            if grating is not None and hasattr(shamrock, "set_grating"):
+                shamrock.set_grating(grating)
+    except Exception as e:
+        print(f"WARNING: shamrock config skipped: {e}")
+
+    # ---------- power meter ----------
+    pow_cfg = inst.get("powermeter", {}) or {}
+    pow_enabled = bool(pow_cfg.get("enabled", False))
+    pow_channel = str(pow_cfg.get("channel", "B"))
+
+    powermeter = None
+    pm_sampler = None
+    if pow_enabled:
+        print(f"\nConnecting powermeter (channel {pow_channel})...")
+        powermeter = PowerMeter(pow_channel)
+        powermeter.powermeter.initialize_instrument()
+        try:
+            powermeter._empty_buffer()
+        except Exception:
+            pass
+        pm_sampler = PowerSampler(powermeter)
+        pm_sampler.start(sample_period_s=pm_dt)
+        print("Power meter OK.")
+    else:
+        print("\nPowermeter disabled.")
+
+    # ---------- ws7 sampler ----------
+    wl_sampler = WavelengthSampler(ws7, ch2=False)
+    wl_sampler.start(sample_period_s=ws7_dt)
+
+    # ---------- configure kinetics ----------
+    print("\nConfiguring kinetics...")
+    exp_actual_s, cycle_actual_s = ccd.setup_kinetics(
+        exposure_time=exposure_s_req,
+        cycle_time=cycle_s_req,
+        n_frames=n_frames,
+        readout_mode=parse_andor_readout_mode(det.get("readout_mode", "FVB")),
+        temperature=temperature_C,
+        cool_down=False,  # do not block here (matches your test script)
+        cosmic_ray_filter=parse_cosmic_ray_filter(det.get("cosmic_ray_filter", True)),
+    )
+    print(f"Kinetics configured: exp_actual={exp_actual_s:.6f}s, cycle_actual={cycle_actual_s:.6f}s")
+
+
+    print(f"\nStarting Andor kinetics and segment scan ...")
+
+    # -----------------------
+    # Pre-lock / align start (same logic as timetagger mode)
+    # -----------------------
+    tol_nm = float(scan.get("start_tolerance_nm", scan.get("tol_nm", 5e-5)))
+    prelock = str(scan.get("prelock", "stabilize")).strip().lower()  # none|stabilize|full
+    stabilize_settle_s = float(scan.get("stabilize_settle_s", 0.5))
+
+    seek_timeout_s = float(scan.get("seek_timeout_s", 90.0))
+    seek_coarse_speed = float(scan.get("seek_coarse_speed_nm_per_s", 0.01))
+    seek_fine_speed = float(scan.get("seek_fine_speed_nm_per_s", 0.0005))
+    seek_fine_window = float(scan.get("seek_fine_window_nm", max(5 * tol_nm, 5e-4)))
+    poll_dt_s = float(scan.get("poll_dt_s", 0.05))
+
+    def ensure_lock_and_loops_local():
+        # mirrors your timetagger behavior
+        try:
+            if hasattr(matisse, "start_laser_lock_correction"):
+                matisse.start_laser_lock_correction()
+        except Exception:
+            pass
+        try:
+            if hasattr(matisse, "start_control_loops"):
+                matisse.start_control_loops()
+        except Exception:
+            pass
+
+    print(f"\nPre-lock mode: {prelock}")
+    safe_stop_scan(matisse)
+    ensure_lock_and_loops_local()
+
+    # never let stabilize fight seeking
+    try:
+        matisse.stabilize_off()
+    except Exception:
+        pass
     safe_stop_scan(matisse)
 
-    if prelock in ("stabilize", "full"):
-        # ensure you're actually at start_nm before scanning
-        wl_now = ws7_read_air_nm(ws7, ch2=ch2)
+    if prelock == "full":
+        # heavy/slow absolute path if your driver supports it
+        print(f"Calling matisse.set_wavelength({start_nm:.6f}) ...")
+        matisse.set_wavelength(start_nm)
+
+    elif prelock == "stabilize":
+        wl_now = ws7_read_air_nm(ws7, ch2=False)
         if wl_now > 0 and abs(wl_now - start_nm) > tol_nm:
-            print(f"Seeking to start {start_nm:.6f} nm...")
-            _ = seek_to_wavelength(
+            wl_seek = seek_to_wavelength(
                 matisse=matisse,
                 ws7=ws7,
                 target_nm=start_nm,
@@ -1391,121 +1653,369 @@ def run_scan_andor_kinetic(cfg: Dict[str, Any]) -> None:
                 coarse_speed_nm_s=seek_coarse_speed,
                 fine_speed_nm_s=seek_fine_speed,
                 fine_window_nm=seek_fine_window,
-                ch2=ch2,
+                ch2=False,
             )
+            print(f"Seek result: WS7_air={wl_seek:.9f}")
+        else:
+            print("Already within tolerance; skipping SEEK.")
 
-        # brief stabilize settle then OFF
+        # “lock at start”: prefer your proven lock path if available, else stabilize briefly
+        locked = False
         try:
-            matisse.target_wavelength = float(start_nm)
-            matisse.stabilize_on()
-            if stabilize_settle_s > 0:
-                time.sleep(stabilize_settle_s)
+            if "ple" in locals() and hasattr(ple, "lock_at_wavelength"):
+                print(f"Locking at start {start_nm:.6f} nm via ple.lock_at_wavelength() ...")
+                ple.lock_at_wavelength(round(start_nm, 6))
+                locked = True
+        except Exception:
+            locked = False
+
+        if not locked:
+            # fallback: brief stabilize settle at start
+            try:
+                matisse.target_wavelength = float(start_nm)
+            except Exception:
+                pass
+            try:
+                matisse.stabilize_on()
+                if stabilize_settle_s > 0:
+                    time.sleep(stabilize_settle_s)
+            finally:
+                try:
+                    matisse.stabilize_off()
+                except Exception:
+                    pass
+
+    elif prelock == "none":
+        pass
+    else:
+        raise ValueError(f"Unknown prelock={prelock!r}. Use none|stabilize|full.")
+
+    wl_start = ws7_read_air_nm(ws7, ch2=False)
+    print(f"Start check: WS7_air={wl_start if wl_start > 0 else None} (target {start_nm:.6f}±{tol_nm:.6f})")
+
+    # critical: stabilize OFF before scanning
+    try:
+        matisse.stabilize_off()
+    except Exception:
+        pass
+    safe_stop_scan(matisse)
+
+    # ---- Build segment plan from YAML (same behavior as timetagger mode) ----
+    segments_str = scan.get("segments", None)
+    relative = bool(scan.get("relative", False))
+    default_scan_speed = float(scan.get("scan_speed_nm_per_s", scan.get("scan_speed", 0.005)))
+    plan = build_scan_plan(start_nm, end_nm, default_scan_speed, segments_str, relative)
+    if not plan:
+        raise ValueError("Empty scan plan. Check scan.segments / scan.end_nm.")
+    end_nm_plan = float(plan[-1][0])
+
+    # tolerance / polling for segment boundaries
+    seg_tol_nm = float(scan.get("segment_tolerance_nm", scan.get("start_tolerance_nm", scan.get("tol_nm", 5e-5))))
+    poll_dt_s = float(scan.get("poll_dt_s", 0.05))
+
+    # ---- detect which dir increases wavelength (best-effort) ----
+    def detect_dir_map(
+            tap_s: float = 0.4,
+            test_speed: float = 0.01,
+            min_move_nm: float = 2e-6,
+    ) -> tuple[int, int]:
+        """
+        Returns (dir_up, dir_down) where dir_up SHOULD make wavelength increase.
+
+        IMPORTANT: drift/lock correction can cause both taps to move the same sign.
+        If ambiguous, we fall back to (0,1) and rely on per-segment sanity checks.
+        """
+        try:
+            set_scan_speed(matisse, float(test_speed))
+            deltas: dict[int, float] = {}
+
+            for d in (0, 1):
+                safe_stop_scan(matisse)
+
+                wl_before = ws7_read_air_nm(ws7, ch2=False)
+                if wl_before <= 0:
+                    continue
+
+                matisse.start_scan(int(d))
+                time.sleep(max(0.2, float(tap_s)))
+                safe_stop_scan(matisse)
+
+                wl_after = ws7_read_air_nm(ws7, ch2=False)
+                if wl_after > 0:
+                    deltas[d] = wl_after - wl_before
+
+                time.sleep(0.1)
+
+            if 0 in deltas and 1 in deltas:
+                d0, d1 = deltas[0], deltas[1]
+                print(f"(dir_map) tap deltas: dir0={d0:+.6e} nm, dir1={d1:+.6e} nm", flush=True)
+
+                # Ambiguous: both moved same sign (drift dominates)
+                if (d0 > +min_move_nm and d1 > +min_move_nm) or (d0 < -min_move_nm and d1 < -min_move_nm):
+                    print("(dir_map) ambiguous (both deltas same sign) -> default dir_up=0, dir_down=1", flush=True)
+                    return (0, 1)
+
+                # Clear case: opposite signs
+                if d0 > +min_move_nm and d1 < -min_move_nm:
+                    return (0, 1)
+                if d1 > +min_move_nm and d0 < -min_move_nm:
+                    return (1, 0)
+
+                # Weak/noisy: choose "more increasing", but segment sanity check may swap later
+                dir_up = 0 if d0 > d1 else 1
+                return (dir_up, 1 - dir_up)
+
+        except Exception as e:
+            print(f"(dir_map) WARNING: direction detect failed: {e}", flush=True)
+
         finally:
+            safe_stop_scan(matisse)
+
+        return (0, 1)
+
+    dir_up0, dir_down0 = detect_dir_map()
+    dir_map = {"up": int(dir_up0), "down": int(dir_down0)}
+
+    print(f"\nStarting Andor kinetics and segment scan (dir_up={dir_map['up']}, dir_down={dir_map['down']}) ...",
+          flush=True)
+
+    stop_evt = threading.Event()
+    scan_err: dict[str, Exception | None] = {"exc": None}
+
+
+    # --- start scan thread + acquisition (you should already have this around it) ---
+    # ---- start acquisition + segment scanning with PRIMING GATE ----
+    scan_ready_evt = threading.Event()  # scan is ready to start "for real"
+    go_evt = threading.Event()  # permission to begin the real scan
+
+    prime_timeout_s = float(scan.get("prime_timeout_s", 20.0))
+    prime_seek_back = bool(scan.get("prime_seek_back_to_start", True))
+    prime_tap_s = float(scan.get("prime_tap_s", 0.5))
+    prime_max_tries = int(scan.get("prime_max_tries", 6))
+
+    def prime_first_segment_direction() -> None:
+        """
+        Decide the correct mapping using ONLY the first segment, BEFORE Andor acquisition starts.
+        Updates dir_map in-place if needed.
+        """
+        if not plan:
+            raise RuntimeError("prime: empty plan")
+
+        seg_end_nm, seg_speed = plan[0]
+        seg_end_nm = float(seg_end_nm)
+        seg_speed = float(seg_speed)
+
+        # ensure stabilize isn't fighting
+        try:
+            matisse.stabilize_off()
+        except Exception:
+            pass
+        safe_stop_scan(matisse)
+
+        for k in range(prime_max_tries):
+            wl_a = ws7_read_air_nm(ws7, ch2=False)
+            if wl_a <= 0:
+                time.sleep(0.05)
+                continue
+
+            err_a = abs(seg_end_nm - wl_a)
+            need_up = (seg_end_nm >= wl_a)
+            direction = dir_map["up"] if need_up else dir_map["down"]
+
+            # short tap at the REAL segment speed
+            safe_stop_scan(matisse)
+            try:
+                matisse.target_wavelength = round(seg_end_nm, 6)
+            except Exception:
+                pass
+            set_scan_speed(matisse, seg_speed)
+            matisse.start_scan(int(direction))
+            time.sleep(max(0.25, prime_tap_s))
+            safe_stop_scan(matisse)
+
+            wl_b = ws7_read_air_nm(ws7, ch2=False)
+            if wl_b <= 0:
+                continue
+            err_b = abs(seg_end_nm - wl_b)
+
+            # if error got worse, mapping is wrong -> swap
+            if err_b > err_a + float(scan.get("dir_check_err_eps_nm", 2e-5)):
+                print(
+                    f"(prime) WRONG DIR for seg1 (wl {wl_a:.9f}->{wl_b:.9f}, |err| {err_a:.6e}->{err_b:.6e}). "
+                    f"Swapping dir_map.",
+                    flush=True
+                )
+                dir_map["up"], dir_map["down"] = dir_map["down"], dir_map["up"]
+                continue
+
+            # good enough
+            print(f"(prime) Direction looks good for seg1 after {k + 1} tries.", flush=True)
+            return
+
+        raise RuntimeError("(prime) Could not find a direction that reduces |error| for seg1.")
+
+    def segment_scan_worker():
+        try:
+            # --------- PRIMING (NO Andor acquisition yet) ---------
+            prime_first_segment_direction()
+
+            # optional: return to start + lock/settle again so kinetics starts clean
+            if prime_seek_back:
+                safe_stop_scan(matisse)
+                try:
+                    matisse.stabilize_off()
+                except Exception:
+                    pass
+
+                wl_seek = seek_to_wavelength(
+                    matisse=matisse,
+                    ws7=ws7,
+                    target_nm=float(start_nm),
+                    tol_nm=float(scan.get("start_tolerance_nm", scan.get("tol_nm", 5e-5))),
+                    poll_dt_s=float(scan.get("poll_dt_s", 0.05)),
+                    timeout_s=float(scan.get("seek_timeout_s", 90.0)),
+                    coarse_speed_nm_s=float(scan.get("seek_coarse_speed_nm_per_s", 0.01)),
+                    fine_speed_nm_s=float(scan.get("seek_fine_speed_nm_per_s", 0.0005)),
+                    fine_window_nm=float(scan.get("seek_fine_window_nm", 5e-4)),
+                    ch2=False,
+                )
+                print(f"(prime) Back at start: WS7_air={wl_seek:.9f}", flush=True)
+
+                # optional brief settle (then OFF before scan)
+                settle = float(scan.get("stabilize_settle_s", 0.3))
+                try:
+                    matisse.target_wavelength = float(start_nm)
+                    matisse.stabilize_on()
+                    if settle > 0:
+                        time.sleep(settle)
+                finally:
+                    try:
+                        matisse.stabilize_off()
+                    except Exception:
+                        pass
+                safe_stop_scan(matisse)
+
+            # signal main thread that scan is ready, then wait for go
+            scan_ready_evt.set()
+            if not go_evt.wait(timeout=prime_timeout_s):
+                raise TimeoutError("Scan worker never received go_evt to start scan.")
+
+            # --------- REAL segment scan (during Andor kinetics) ---------
             try:
                 matisse.stabilize_off()
             except Exception:
                 pass
 
-    # ------------------------
-    # start wavemeter + power samplers
-    # ------------------------
-    wl_sampler = WavelengthSampler(ws7, ch2=ch2)
-    wl_sampler.start(sample_period_s=ws7_dt)
+            # from here onward: do NOT do any more tap-based direction discovery;
+            # just run segments using the dir_map we already primed.
+            for seg_end_nm, seg_speed in plan:
+                if stop_evt.is_set():
+                    break
 
-    powermeter = None
-    pm_sampler = None
-    if pow_enabled:
-        print(f"Connecting powermeter (channel {pow_channel})...")
-        powermeter = PowerMeter(pow_channel)
-        powermeter.powermeter.initialize_instrument()
-        try:
-            powermeter._empty_buffer()
-        except Exception:
-            pass
-        pm_sampler = PowerSampler(powermeter)
-        pm_sampler.start(sample_period_s=pm_dt)
-        time.sleep(max(0.2, 3 * pm_dt))  # give it time to accumulate samples
+                seg_end_nm = float(seg_end_nm)
+                seg_speed = float(seg_speed)
 
-    # ------------------------
-    # configure kinetics
-    # ------------------------
-    exp_actual_s, cycle_actual_s = ccd.setup_kinetics(
-        exposure_time=exposure_s_req,
-        cycle_time=cycle_s_req,
-        n_frames=n_frames,
-        readout_mode=readout_mode,
-        temperature=temperature_C,
-        cool_down=False,                 # IMPORTANT: do not block here (we handled cooling above)
-        cosmic_ray_filter=cosmic_ray_filter,
-    )
+                wl_here = ws7_read_air_nm(ws7, ch2=False)
+                if wl_here <= 0:
+                    wl_here = start_nm
 
-    kinetic_duration_s = n_frames * cycle_actual_s
-    if auto_speed:
-        scan_speed = abs(end_nm - start_nm) / kinetic_duration_s if kinetic_duration_s > 0 else manual_speed
-    else:
-        scan_speed = manual_speed
+                need_up = (seg_end_nm >= wl_here)
+                direction = dir_map["up"] if need_up else dir_map["down"]
 
-    # NEW: robust direction mapping
-    dir_up = detect_dir_up(matisse, ws7, ch2=ch2, tap_s=0.5, speed_nm_s=max(0.01, scan_speed))
-    dir_down = 1 - dir_up
-    scan_dir = dir_up if end_nm >= start_nm else dir_down
+                print(
+                    f"  segment -> end={seg_end_nm:.6f} nm  speed={abs(seg_speed):.6f} nm/s  "
+                    f"need_up={need_up}  dir={direction} (map up={dir_map['up']} down={dir_map['down']})",
+                    flush=True
+                )
 
-    t_acq_start = None
-    t_acq_end = None
+                safe_stop_scan(matisse)
+                try:
+                    matisse.target_wavelength = round(seg_end_nm, 6)
+                except Exception:
+                    pass
+                set_scan_speed(matisse, seg_speed)
+                matisse.start_scan(int(direction))
 
+                while not stop_evt.is_set():
+                    wl = ws7_read_air_nm(ws7, ch2=False)
+                    if wl > 0:
+                        if direction == dir_map["up"] and wl >= (seg_end_nm - seg_tol_nm):
+                            break
+                        if direction == dir_map["down"] and wl <= (seg_end_nm + seg_tol_nm):
+                            break
+                    time.sleep(poll_dt_s)
+
+                safe_stop_scan(matisse)
+
+            safe_stop_scan(matisse)
+
+        except Exception as e:
+            scan_err["exc"] = e
+            stop_evt.set()
+            safe_stop_scan(matisse)
+
+    # start scan thread (it will PRIME, then wait)
+    scan_th = threading.Thread(target=segment_scan_worker, daemon=True)
+    scan_th.start()
+
+    # wait until scan thread says it's ready (direction known + optionally back to start)
+    if not scan_ready_evt.wait(timeout=prime_timeout_s):
+        stop_evt.set()
+        raise TimeoutError("Scan priming did not finish before prime_timeout_s.")
+
+    # start kinetics ONLY after scan is ready, then release scan to begin real motion
+    t_acq_start = time.monotonic()
+    go_evt.set()
+    ccd.start_acquisition()
+
+    ok = wait_for_ccd_with_timeout(ccd, timeout_s=max_run_time_s)
+    t_acq_end = time.monotonic()
+
+    if scan_err["exc"] is not None:
+        raise scan_err["exc"]
+    if not ok:
+        raise TimeoutError(f"Andor kinetics did not finish within max_run_time_s={max_run_time_s}s.")
+
+    # stop samplers AFTER acquisition is done (buffer remains for stats)
     try:
+        wl_sampler.stop()
+    except Exception:
+        pass
+    if pm_sampler is not None:
         try:
-            matisse.stabilize_off()
+            pm_sampler.stop()
         except Exception:
             pass
 
-        try:
-            matisse.query(f"SCAN:RISINGSPEED {scan_speed:.20f}")
-            matisse.query(f"SCAN:FALLINGSPEED {scan_speed:.20f}")
-        except Exception:
-            pass
-
-        try:
-            matisse.target_wavelength = round(float(end_nm), 6)
-        except Exception:
-            pass
-
-        print(f"Starting scan: dir={scan_dir} (dir_up={dir_up}), speed={scan_speed:.6f} nm/s")
-        matisse.start_scan(scan_dir)
-
-        # start kinetics
+    # ---- Frame-aligned extraction (wl + power) ----
+    if t_acq_start is None or t_acq_end is None:
+        # defensive fallback (shouldn't happen now)
         t_acq_start = time.monotonic()
-        ccd.start_acquisition()
-        ok = wait_for_ccd_with_timeout(ccd, timeout_s=max_run_time_s)
-        t_acq_end = time.monotonic()
-        if not ok:
-            raise TimeoutError(f"Andor kinetics did not finish within max_run_time_s={max_run_time_s}s.")
+        t_acq_end = t_acq_start
 
-    finally:
-        try:
-            matisse.stop_scan()
-        except Exception:
-            pass
-        try:
-            wl_sampler.stop()
-        except Exception:
-            pass
-        try:
-            if pm_sampler is not None:
-                pm_sampler.stop()
-        except Exception:
-            pass
-        try:
-            if powermeter is not None:
-                powermeter.powermeter.terminate_instrument()
-        except Exception:
-            pass
+    wins = frame_windows(t_acq_start, exp_actual_s, cycle_actual_s, n_frames)
 
-    # ------------------------
-    # save SIF
-    # ------------------------
+    frame_wl = np.full(n_frames, np.nan, dtype=float)
+    frame_wl_std = np.full(n_frames, np.nan, dtype=float)
+    frame_power = np.full(n_frames, np.nan, dtype=float)
+
+    last_power = np.nan
+    for i, (t0, t1) in enumerate(wins):
+        wl_mean, wl_std, _n = wl_sampler.stats_between(t0, t1)
+        frame_wl[i] = wl_mean
+        frame_wl_std[i] = wl_std
+
+        if pm_sampler is not None:
+            p = pm_sampler.mean_between(t0, t1)
+            if p is None or (isinstance(p, float) and not np.isfinite(p)):
+                p = last_power
+            else:
+                last_power = p
+            frame_power[i] = p
+
+    # ---------- save SIF (matches your working test script) ----------
     tmp_name = f"{base}.sif"
-    ccd.save_as_sif(tmp_name, spectrograph.calibration_coefficients)
+    ccd.save_as_sif(tmp_name)  # no spectrograph coeff dependency
     try:
         if os.path.exists(sif_path):
             os.remove(sif_path)
@@ -1513,22 +2023,19 @@ def run_scan_andor_kinetic(cfg: Dict[str, Any]) -> None:
     except Exception:
         pass
 
-    if t_acq_start is None or t_acq_end is None:
+    # ---------- align WS7/power to frames ----------
+    if t_acq_start is None:
         t_acq_start = time.monotonic()
+    if t_acq_end is None:
         t_acq_end = t_acq_start
 
-    # ------------------------
-    # frame-aligned wl + power
-    # ------------------------
     wins = frame_windows(t_acq_start, exp_actual_s, cycle_actual_s, n_frames)
 
     frame_wl = np.full(n_frames, np.nan, dtype=float)
     frame_wl_std = np.full(n_frames, np.nan, dtype=float)
     frame_power = np.full(n_frames, np.nan, dtype=float)
 
-    last_power = None
     for i, (t0, t1) in enumerate(wins):
-        # wavemeter
         try:
             wl_mean, wl_std, _n = wl_sampler.stats_between(t0, t1)
             frame_wl[i] = wl_mean
@@ -1536,35 +2043,46 @@ def run_scan_andor_kinetic(cfg: Dict[str, Any]) -> None:
         except Exception:
             pass
 
-        # power (forward-fill to avoid NaNs)
         if pm_sampler is not None:
             p = pm_sampler.mean_between(t0, t1)
             if p is None or (isinstance(p, float) and not np.isfinite(p)):
-                p = last_power
+                p = last_power_W
             else:
-                last_power = p
+                last_power_W = p
             if p is not None:
                 frame_power[i] = float(p)
 
     raw_wl_t = np.array([s.t for s in wl_sampler.buf], dtype=float)
-    raw_wl = np.array([s.wl_nm for s in wl_sampler.buf], dtype=float)
+    raw_wl   = np.array([s.wl_nm for s in wl_sampler.buf], dtype=float)
 
     if pm_sampler is not None:
         raw_p_t = np.array([s.t for s in pm_sampler.buf], dtype=float)
-        raw_p = np.array([s.power_W for s in pm_sampler.buf], dtype=float)
+        raw_p   = np.array([s.power_W for s in pm_sampler.buf], dtype=float)
     else:
         raw_p_t = np.array([], dtype=float)
-        raw_p = np.array([], dtype=float)
+        raw_p   = np.array([], dtype=float)
 
-    meta: Dict[str, Any] = {
+    # --- define scan speed fields for metadata ---
+    duration_measured_s = float(t_acq_end - t_acq_start) if (
+                t_acq_start is not None and t_acq_end is not None) else float("nan")
+    scan_speed_effective_nm_per_s = (
+        abs(end_nm - start_nm) / duration_measured_s
+        if np.isfinite(duration_measured_s) and duration_measured_s > 0
+        else float("nan")
+    )
+
+    meta = {
         "mode": "andor_kinetic",
         "start_nm_air": start_nm,
         "end_nm_air": end_nm,
+        "scan_speed_nm_per_s_effective": float(scan_speed_effective_nm_per_s),
+        "segments": [(float(a), float(b)) for (a, b) in plan],  # if you're using plan in kinetic mode
         "auto_scan_speed_from_kinetic": auto_speed,
-        "scan_speed_nm_per_s": scan_speed,
-        "scan_dir_used": int(scan_dir),
-        "scan_dir_mapping": {"dir_up": int(dir_up), "dir_down": int(dir_down)},
-        "wavemeter": {"ws7_sample_period_s": ws7_dt, "ws7_ch2": ch2},
+        "timestamps": {
+            "t_acq_start_monotonic": float(t_acq_start),
+            "t_acq_end_monotonic": float(t_acq_end),
+        },
+        "wavemeter": {"ws7_sample_period_s": ws7_dt},
         "powermeter": {
             "enabled": pow_enabled,
             "channel": pow_channel if pow_enabled else None,
@@ -1576,23 +2094,19 @@ def run_scan_andor_kinetic(cfg: Dict[str, Any]) -> None:
             "cycle_s_requested": cycle_s_req,
             "exposure_s_actual": exp_actual_s,
             "cycle_s_actual": cycle_actual_s,
-            "readout_mode": det.get("readout_mode", ccd_kwargs.get("readout_mode", "FVB")),
-            "cosmic_ray_filter": det.get("cosmic_ray_filter", ccd_kwargs.get("cosmic_ray_filter", True)),
-            "duration_s_measured": float(t_acq_end - t_acq_start),
             "temperature_C": temperature_C,
             "persist_cooling_on_shutdown": persist_cooling,
-            "sif_path": os.path.abspath(sif_path) if os.path.exists(sif_path) else os.path.abspath(tmp_name),
+            "sif_path": os.path.abspath(sif_path),
         },
-        "timestamps": {
-            "t_acq_start_monotonic": float(t_acq_start),
-            "t_acq_end_monotonic": float(t_acq_end),
-        },
+        "old_device_config": old_cfg,  # store your legacy block
         "created_unix_s": time.time(),
     }
 
-    save_meta_json_if_enabled(meta_path, meta, save_meta)
+    if save_meta:
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
 
-    os.makedirs(os.path.dirname(data_path) or ".", exist_ok=True)
+    # save aligned arrays + raw traces
     if fmt == "h5":
         import h5py
         with h5py.File(data_path, "w") as h:
@@ -1618,12 +2132,11 @@ def run_scan_andor_kinetic(cfg: Dict[str, Any]) -> None:
             meta=np.array([meta], dtype=object),
         )
 
-    print(f"Saved SIF : {sif_path}")
+    print(f"\nSaved SIF : {sif_path}")
     if save_meta:
         print(f"Saved meta: {meta_path}")
     print(f"Saved data: {data_path}")
-    print(f"Kinetics frames: {n_frames}, measured duration: {float(t_acq_end - t_acq_start):.3f}s")
-
+    print(f"Kinetics frames: {n_frames}, measured duration: {(t_acq_end - t_acq_start):.3f}s")
 
 # -------------------------
 # Main dispatch

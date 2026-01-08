@@ -5,7 +5,7 @@ RunScan:
   # ---------------------------
   output:
     directory: data
-    basename: scan_test
+    basename: scan_test_kinetic_segmentspeed
     format: h5          # h5 or npz
     overwrite: true
     save_meta_json: true
@@ -19,6 +19,7 @@ RunScan:
     prelock: stabilize          # none | stabilize | full
     start_tolerance_nm: 0.00005
     stabilize_settle_s: 0.5
+    auto_scan_speed_from_kinetic: false
 
     # seek behavior
     seek_timeout_s: 90.0
@@ -36,6 +37,12 @@ RunScan:
 
     # runtime safety
     max_run_time_s: 900.0
+
+    #andor make sure the scan direction is right
+    prime_timeout_s: 20
+    prime_seek_back_to_start: true
+    prime_tap_s: 0.5
+    prime_max_tries: 6
 
     # ---------
     # Piecewise scan plan (for timetagger_counts mode)
@@ -77,14 +84,14 @@ RunScan:
         # ---- cooling behavior (like your working test_andor_kinetics.py) ----
         temperature_C: -65.0
         temp_tol_C: 1.0
-        wait_for_cooldown: false
+        wait_for_cooldown: true
         wait_timeout_s: 1800.0
         persist_cooling_on_shutdown: true
 
         # ---- kinetics timing ----
-        exposure_s: 0.10
+        exposure_s: 0.2
         cycle_s: 0.12
-        n_frames: 50
+        n_frames: 100
 
         # ---- basic Andor options your run_scan currently understands ----
         readout_mode: FVB               # FVB | SINGLE_TRACK (per your parser)
@@ -108,3 +115,47 @@ RunScan:
           pre_amp_gain: null
 
 
+# Legacy device block (old code)
+# -----------------------------
+PLEScan:
+  DAQController:
+    import_path: qt3utils.applications.controllers.andor_spectrometer
+    class_name: AndorSpectrometerController
+    configure:
+      ccd_device_index: 0
+      spg_device_index: 0
+
+      grating: null
+      center_wavelength: 370  # nm
+
+      pixel_offset: 0.0
+      wavelength_offset: 0.0  # nm
+
+      input_port: SIDE
+      output_port: DIRECT
+
+      read_mode: FVB
+      acquisition_mode: KINETICS
+      trigger_mode: INTERNAL
+
+      exposure_time: 10
+      number_of_accumulations: 1
+      accumulation_cycle_time: 10
+      number_of_kinetics: 1
+      kinetic_cycle_time: 1
+
+      baseline_clamp: true
+      cosmic_ray_removal: true
+      keep_clean_on_external_trigger: true
+
+      single_track_center_row: null
+      single_track_height: null
+
+      vertical_shift_speed: null
+      horizontal_shift_speed: [0, 0, 0.05]
+      pre_amp_gain: null
+
+      target_sensor_temperature: -65
+      reach_temperature_before_acquisition: true
+      cooler: true
+      cooler_persistence: true
