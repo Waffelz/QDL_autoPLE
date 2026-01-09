@@ -5,7 +5,7 @@ RunScan:
   # ---------------------------
   output:
     directory: data
-    basename: scan_test_kinetic_segmentspeed
+    basename: scan_test_timetagger_segmentspeed
     format: h5          # h5 or npz
     overwrite: true
     save_meta_json: true
@@ -15,7 +15,7 @@ RunScan:
   # ---------------------------
   scan:
     # start alignment + seeking
-    start_nm: 739.300
+    start_nm: 739.314
     prelock: stabilize          # none | stabilize | full
     start_tolerance_nm: 0.00005
     stabilize_settle_s: 0.5
@@ -23,7 +23,7 @@ RunScan:
 
     # seek behavior
     seek_timeout_s: 90.0
-    seek_coarse_speed_nm_per_s: 0.01
+    seek_coarse_speed_nm_per_s: 0.001
     seek_fine_speed_nm_per_s: 0.0005
     seek_fine_window_nm: 0.001
     poll_dt_s: 0.05
@@ -43,6 +43,8 @@ RunScan:
     prime_seek_back_to_start: true
     prime_tap_s: 0.5
     prime_max_tries: 6
+    prime_seek_back_threshold_nm: 0.00025   # only seek-back if >0.25 pm away
+    prime_seek_back_timeout_s: 8.0          # keep priming bounded
 
     # ---------
     # Piecewise scan plan (for timetagger_counts mode)
@@ -51,8 +53,8 @@ RunScan:
     # If segments is omitted, it can fall back to end_nm + default scan_speed.
     relative: false
     end_nm: 739.305
-    scan_speed_nm_per_s: 0.002
-    segments: "739.302,0.002;739.303,0.0005;739.305,0.002"
+    scan_speed_nm_per_s: 0.001
+    segments: "739.324,0.002;739.330,0.0005;739.340,0.002"
 
   # ---------------------------
   # Instruments
@@ -68,7 +70,7 @@ RunScan:
       # CHANGE ONLY THIS LINE to switch mode:
       #   timetagger_counts  -> TimeTagger counting scan
       #   andor_kinetic      -> Andor kinetics scan
-      mode: andor_kinetic
+      mode: timetagger_counts
 
       # ---- Mode A: TimeTagger counts ----
       timetagger_counts:
